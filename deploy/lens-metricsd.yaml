@@ -38,6 +38,19 @@ subjects:
     name: lens-metricsd
     namespace: lens-metrics
 ---
+# 64Mi against a snapshot of ~6 MB at the default 24h retention. No
+# storageClassName, so it takes the cluster default (local-path on k3s).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lens-metricsd
+  namespace: lens-metrics
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 64Mi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,7 +62,9 @@ spec:
   # Exactly one. The series live in the process, so a second replica
   # would hold a different history and the Service would alternate
   # between them -- graphs would flicker between two versions of the
-  # truth depending on which pod answered.
+  # truth depending on which pod answered. Recreate rather than
+  # RollingUpdate is now load-bearing too: the snapshot volume is RWO and
+  # two pods could not mount it at once.
   replicas: 1
   strategy:
     type: Recreate
@@ -66,6 +81,11 @@ spec:
         runAsUser: 65534
         runAsGroup: 65534
         runAsNonRoot: true
+        # Without this the provisioner's root-owned directory is not
+        # writable by 65534 and every snapshot fails with EACCES -- while
+        # the daemon otherwise runs perfectly, so it only shows up as
+        # history that never survives a restart.
+        fsGroup: 65534
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -82,6 +102,15 @@ spec:
               value: "30"
             - name: RETENTION_HOURS
               value: "24"
+            # Unset would disable persistence. This path is the mounted
+            # volume below.
+            - name: SNAPSHOT_PATH
+              value: /var/lib/lens-metricsd/snapshot.bin
+            # The upper bound on history lost to an UNCLEAN kill. A
+            # rollout or any other SIGTERM writes a final snapshot and
+            # costs nothing.
+            - name: SNAPSHOT_INTERVAL_SECONDS
+              value: "300"
           ports:
             - name: http
               containerPort: 9090
@@ -96,6 +125,12 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 30
+          volumeMounts:
+            # readOnlyRootFilesystem below still applies: it makes the
+            # ROOT filesystem read-only, and mounted volumes stay
+            # writable, so persistence costs none of the hardening.
+            - name: snapshot
+              mountPath: /var/lib/lens-metricsd
           resources:
             requests:
               cpu: 20m
@@ -110,6 +145,10 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: snapshot
+          persistentVolumeClaim:
+            claimName: lens-metricsd
 ---
 # The name and namespace are load-bearing. Lens' built-in "Lens" provider
 # does a literal lookup of the Service named `prometheus` in namespace

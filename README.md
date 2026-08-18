@@ -127,7 +127,39 @@ a working scrape with blank charts.
   Storage classes with real quotas report real per-volume usage.
 - **High availability.** The series live in the process, so run exactly
   one replica: a second would hold a different history and the Service
-  would alternate between them. A restart resets history.
+  would alternate between them.
+
+## Persistence
+
+The store is in memory, but it is snapshotted to disk so a restart does
+not cost a day of history. A **SIGTERM — every ordinary rollout — writes a
+final snapshot and loses nothing**; an unclean kill costs at most
+`SNAPSHOT_INTERVAL_SECONDS`.
+
+It is a periodic snapshot rather than a write-through store on purpose:
+Lens re-queries every chart once a minute over ranges up to 24h, so
+reading from disk would mean constant I/O to serve a working set that
+fits in 9 MB of RAM. One sequential write every few minutes keeps the
+query path a pointer walk.
+
+Three properties matter more than the format:
+
+- **The write is atomic** — a temporary file renamed over the target, then
+  fsynced. A process killed mid-write leaves the previous good snapshot
+  intact; without it, one OOM would turn into permanent data loss.
+- **A bad snapshot is never fatal.** It is logged and the daemon starts
+  empty. Persistence that can wedge the process into `CrashLoopBackOff` is
+  worse than none.
+- **Loading re-applies retention**, so a pod that was down for six hours
+  does not come back with six hours of stale points.
+
+Set `SNAPSHOT_PATH` to enable it and mount a volume there. The supplied
+manifest includes a 64Mi PVC. Note the pod needs `fsGroup` matching
+`runAsUser`, or the provisioner's root-owned directory is not writable and
+every snapshot fails with `EACCES` — while the daemon otherwise runs
+perfectly, so it surfaces only as history that never survives.
+`readOnlyRootFilesystem: true` still applies: it covers the *root*
+filesystem, and mounted volumes stay writable.
 
 ## Configuration
 
@@ -135,6 +167,8 @@ a working scrape with blank charts.
 | --- | --- | --- |
 | `SCRAPE_INTERVAL_SECONDS` | `30` | Halving it doubles the store's memory. |
 | `RETENTION_HOURS` | `24` | Covers Lens' longest range. |
+| `SNAPSHOT_PATH` | *(unset)* | Unset disables persistence, so the daemon runs fine with no volume attached. |
+| `SNAPSHOT_INTERVAL_SECONDS` | `300` | Upper bound on history lost to an *unclean* kill. |
 | `LISTEN_ADDR` | `0.0.0.0:9090` | |
 
 RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy`.

@@ -559,3 +559,127 @@ fn series_that_stop_reporting_are_dropped_entirely() {
     );
     assert_eq!(store.series_count(), 1);
 }
+
+// --- persistence ------------------------------------------------------------
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("lens-metricsd-test-{name}-{}", std::process::id()));
+    p.push("snapshot.bin");
+    p
+}
+
+#[test]
+fn a_snapshot_round_trips_every_series_and_sample() {
+    let path = temp_path("roundtrip");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    let original = fixture();
+
+    crate::snapshot::save(&original, &path).expect("save");
+    let restored = crate::snapshot::load(&path, 86_400, LAST).expect("load");
+
+    assert_eq!(restored.series_count(), original.series_count());
+    assert_eq!(restored.sample_count(), original.sample_count());
+
+    // The real check is not the counts but that queries still answer the
+    // same, which exercises labels, ordering and the name index together.
+    for query in [
+        r#"sum(kubelet_running_pods{instance=~"node-a"})"#,
+        r#"sum(node_memory_MemTotal_bytes{kubernetes_node=~"node-a"} - (node_memory_MemFree_bytes{kubernetes_node=~"node-a"} + node_memory_Buffers_bytes{kubernetes_node=~"node-a"} + node_memory_Cached_bytes{kubernetes_node=~"node-a"})) by (kubernetes_name)"#,
+        r#"sum(rate(node_cpu_seconds_total{kubernetes_node=~"node-a", mode=~"user|system"}[1m]))"#,
+    ] {
+        assert_eq!(
+            one(&original, query),
+            one(&restored, query),
+            "differs for {query}"
+        );
+    }
+
+    // The temporary file must not survive a successful save.
+    assert!(
+        !path.with_extension("tmp").exists(),
+        "a .tmp file was left behind"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn loading_drops_samples_that_aged_out_while_the_process_was_down() {
+    let path = temp_path("stale");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    crate::snapshot::save(&fixture(), &path).expect("save");
+
+    // Back up an hour later, with a ten minute retention: everything in
+    // the snapshot is already history and none of it should return.
+    let restored = crate::snapshot::load(&path, 600, LAST + 3_600).expect("load");
+    assert_eq!(restored.series_count(), 0);
+    assert_eq!(restored.sample_count(), 0);
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn a_corrupt_or_truncated_snapshot_is_an_error_never_a_panic() {
+    let dir = temp_path("corrupt");
+    let dir = dir.parent().unwrap().to_path_buf();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let good = dir.join("good.bin");
+    crate::snapshot::save(&fixture(), &good).expect("save");
+    let bytes = std::fs::read(&good).unwrap();
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", Vec::new()),
+        ("wrong magic", b"XXXX\x01\x00\x00\x00\x00\x00".to_vec()),
+        ("header only", bytes[..6].to_vec()),
+        // The nasty one: a write interrupted by an OOM kill. Without the
+        // temp-and-rename in save() this is what the live file would be.
+        ("truncated mid-series", bytes[..bytes.len() / 2].to_vec()),
+        ("garbage", vec![0xff; 512]),
+    ];
+
+    for (name, content) in cases {
+        let path = dir.join(format!("{}.bin", name.replace(' ', "-")));
+        std::fs::write(&path, &content).unwrap();
+        let result = crate::snapshot::load(&path, 86_400, LAST);
+        assert!(
+            result.is_err(),
+            "{name} should have failed to load, not succeeded"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_snapshot_overwrites_the_previous_one_in_place() {
+    let path = temp_path("overwrite");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+    crate::snapshot::save(&fixture(), &path).expect("first save");
+    let first = std::fs::metadata(&path).unwrap().len();
+
+    let mut bigger = fixture();
+    for n in 0..50 {
+        series(
+            &mut bigger,
+            "container_memory_working_set_bytes",
+            &[
+                ("namespace", "app"),
+                ("pod", &format!("extra-{n}")),
+                ("container", "api"),
+                ("image", "x"),
+            ],
+            1.0,
+            0.0,
+        );
+    }
+    crate::snapshot::save(&bigger, &path).expect("second save");
+
+    assert!(std::fs::metadata(&path).unwrap().len() > first);
+    let restored = crate::snapshot::load(&path, 86_400, LAST).expect("load");
+    assert_eq!(restored.series_count(), bigger.series_count());
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

@@ -130,6 +130,23 @@ impl Store {
         }
     }
 
+    /// Bulk-insert a whole series, as the snapshot loader does. Skips the
+    /// per-sample key building `append` has to do, which matters when
+    /// restoring a few hundred thousand samples at startup.
+    pub fn insert_series(&mut self, labels: Labels, samples: Vec<Sample>) {
+        if samples.is_empty() {
+            return;
+        }
+        let key = canonical_key(&labels);
+        let name = labels.get(NAME_LABEL).cloned().unwrap_or_default();
+        self.by_name.entry(name).or_default().push(key.clone());
+        self.series.insert(key, Series { labels, samples });
+    }
+
+    pub fn series_iter(&self) -> impl Iterator<Item = &Series> {
+        self.series.values()
+    }
+
     pub fn series_count(&self) -> usize {
         self.series.len()
     }
