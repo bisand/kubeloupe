@@ -3,27 +3,33 @@
 **Metrics for [Lens Desktop](https://k8slens.dev) in one static binary.**
 No Prometheus, no node-exporter, no kube-state-metrics.
 
+[![ci](https://github.com/bisand/lens-metricsd/actions/workflows/ci.yml/badge.svg)](https://github.com/bisand/lens-metricsd/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/bisand/lens-metricsd?sort=semver)](https://github.com/bisand/lens-metricsd/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Image size](https://img.shields.io/badge/image-2.0%20MB-green)
-![Resident](https://img.shields.io/badge/resident-~1%20MiB-green)
+![Image size](https://img.shields.io/badge/image-2%20MB-green)
 
 Lens will not draw a chart without a Prometheus-compatible query API. The
 usual way to get one costs three workloads and roughly 170 MB of RAM — to
 produce about twenty series that the Kubernetes API server and the kubelet
 already know.
 
-This reads them directly, keeps a day of samples in memory, and answers
-the subset of PromQL that Lens actually generates.
+This reads them directly, keeps a day of samples in memory, snapshots them
+so a restart costs nothing, and answers the subset of PromQL that Lens
+actually generates.
 
 | | image (compressed) | resident |
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
 | VictoriaMetrics + node-exporter + kube-state-metrics | 50.6 MB | ~170 MB |
-| **lens-metricsd** | **2.0 MB** | **~1 MiB** |
+| **lens-metricsd** | **2.0 MB** | **~10 MiB** |
 
-Measured on a single-node k3s box (1 core, 2 GB) running ~10 pods: 0.9 MiB
-working set, 0.3 millicores. It grows as the ring buffer fills — about
-5 MB at 24h steady state for ~120 series.
+Measured on a single-node k3s box (1 core, 2 GB) running ~10 pods and 136
+series: **1.5 MiB after an hour, 0.2 millicores**, with a 219 KiB snapshot
+on disk. The figure in the table is the projection once the full 24h
+window is resident — 136 series x a 4096-sample ring x 16 bytes — which is
+where it plateaus. Both numbers sit far under the 128Mi limit the manifest
+sets, and the shape is flat, not a leak: retention bounds it, and there
+are tests that say so.
 
 Built for small clusters — homelabs, single-node k3s, edge boxes — where a
 monitoring stack costs more than the workloads it watches.
@@ -194,6 +200,20 @@ node's containerd and set `imagePullPolicy: Never`:
 ```sh
 docker save lens-metricsd:0.2.1 | ssh <node> 'sudo k3s ctr images import -'
 ```
+
+## Releases
+
+Publishing is driven by **releases**, not tags. A tag is a bookmark —
+cheap to push by accident, movable while something is being prepared — so
+pushing one builds nothing. Publishing a GitHub release builds the image
+for both architectures and pushes it to ghcr, which means everything
+published corresponds to something someone decided to ship and wrote a
+changelog for.
+
+> [!NOTE]
+> A `release` event resolves the workflow from the ref the release points
+> at — the tag — not from the default branch. A release published for a
+> tag cut before this workflow existed cannot build itself.
 
 ## Tests
 
