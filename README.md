@@ -40,26 +40,28 @@ monitoring stack costs more than the workloads it watches.
 kubectl apply -f https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
 ```
 
-That creates a `lens-metrics` namespace, a read-only ServiceAccount, one
-Deployment named `kubeloupe`, and a Service named `prometheus`.
+That creates a `kubeloupe` namespace, a read-only ServiceAccount, one
+Deployment, and a Service — all named `kubeloupe`.
 
-**The Service name and namespace are load-bearing, and they are not this
-project's to choose.** Lens' built-in provider looks up exactly one pair —
-a Service named `prometheus` in namespace `lens-metrics` — as fixed
-strings, with no search. That provider is declared `isConfigurable: false`,
-so Lens offers no address field to send it anywhere else. The providers
-that *do* offer one — Operator, Helm, Stacklight — each generate a
-different query grammar, which this daemon does not answer: pointing one of
-those at it yields a working service and empty charts. So those two strings
-are an address Lens dictates, not names this project picked.
+**Lens has to be told where to look, and which grammar to speak.** Its own
+provider is declared `isConfigurable: false` and only ever looks for a
+Service named `prometheus` in namespace `lens-metrics`, so it cannot be
+pointed at anything else. The **Helm** provider can be: it takes an
+explicit service address, and its queries differ from Lens' in eight of
+forty — every one a label rename, `kubernetes_node` → `node` and
+`by (kubernetes_name)` → `by (component)`, rather than a different shape.
+The node series carry both spellings, so either provider gets the same
+numbers. Operator and Stacklight are a different matter: their grammars
+join through `kube_pod_info` with `group_left`, which this daemon does not
+implement.
 
 Then configure Lens — see below. Charts need about two minutes of samples
 before a `rate()` has anything to draw.
 
 ## Configuring Lens
 
-In **Cluster Settings → Metrics**, two settings will otherwise make a
-working daemon look broken. Both fail *silently*:
+In **Cluster Settings → Metrics**, three settings stand between a working
+daemon and one that looks broken. All three fail *silently*:
 
 1. **Set METRICS SOURCE to Prometheus.** Left on `Automatic`, Lens
    Desktop may resolve to "Kubernetes Metrics Server" and report
@@ -70,12 +72,12 @@ working daemon look broken. Both fail *silently*:
    listed there, the cluster overview renders only the issues panel — no
    time-range dropdown, no donuts, no charts, and no error explaining why.
    The `Reset` button clears it.
-
-Leave **PROMETHEUS** on `Auto Detect Prometheus` and the **PROMETHEUS
-SERVICE ADDRESS** field empty. Selecting a specific provider to reveal that
-field is the one tempting wrong turn here: the only provider whose queries
-this daemon answers is `Lens`, and it is exactly the one Lens will not let
-you address.
+3. **Set PROMETHEUS to `Helm` and PROMETHEUS SERVICE ADDRESS to
+   `kubeloupe/kubeloupe:80`.** The address field only appears once the
+   provider is configurable, and `Helm` is the configurable one whose
+   grammar this answers. `Auto Detect` will not find this daemon —
+   detection looks for `lens-metrics/prometheus` and nothing else — and
+   `Operator` or `Stacklight` will find it and then draw nothing.
 
 Leave the **Lens Metrics** page's three toggles (bundled Prometheus,
 kube-state-metrics, node-exporter) **off**. Those install the stack this
@@ -84,9 +86,9 @@ daemon exists to replace.
 ## Verify
 
 ```sh
-kubectl -n lens-metrics get pods
-kubectl get --raw "/api/v1/namespaces/lens-metrics/services/prometheus:80/proxy/-/stats"
-kubectl get --raw "/api/v1/namespaces/lens-metrics/services/prometheus:80/proxy/api/v1/query?query=up"
+kubectl -n kubeloupe get pods
+kubectl get --raw "/api/v1/namespaces/kubeloupe/services/kubeloupe:80/proxy/-/stats"
+kubectl get --raw "/api/v1/namespaces/kubeloupe/services/kubeloupe:80/proxy/api/v1/query?query=up"
 ```
 
 `/-/stats` reports series and sample counts; `up` is 1 per node whose
@@ -179,32 +181,24 @@ memory a different way gets a wrong number, not a missing one.
   one replica: a second would hold a different history and the Service
   would alternate between them.
 
-## Upgrading from lens-metricsd
+## Upgrading
 
-The namespace and Service are unchanged; everything else is renamed, so the
-old objects are left behind rather than updated:
+Everything lives in the `kubeloupe` namespace now, so any earlier install
+is deleted rather than updated:
 
 ```sh
 kubectl apply -f https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
-kubectl -n lens-metrics delete deploy,sa,pvc lens-metricsd
+kubectl delete namespace lens-metrics
 kubectl delete clusterrole,clusterrolebinding lens-metricsd
 ```
 
-The `Service` selector moves to the new label as soon as the manifest is
-applied, so Lens follows the new pod immediately; the old one keeps
-scraping until it is deleted.
+Then set **PROMETHEUS** to `Helm` and **PROMETHEUS SERVICE ADDRESS** to
+`kubeloupe/kubeloupe:80`, as above.
 
-A day of history stays on the old PVC. The snapshot format did not change —
-the file's magic still reads `LMD1` — so copy `snapshot.bin` across first
-if that history is worth the trouble; otherwise the new pod refills within
-the hour.
-
-> [!NOTE]
-> `0.2.4` briefly moved the namespace and Service to `kubeloupe` as well.
-> That was a mistake: it puts the daemon somewhere Lens cannot be told to
-> look. If you installed it, `kubectl delete namespace kubeloupe` after
-> applying the manifest above, and set **PROMETHEUS** back to `Auto Detect
-> Prometheus` with the address field cleared.
+The old PVC goes with the namespace, and a day of history with it. The
+snapshot format has not changed — the file's magic still reads `LMD1` — so
+copy `snapshot.bin` across first if that history is worth the trouble;
+otherwise the new pod refills within the hour.
 
 ## Persistence
 

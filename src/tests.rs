@@ -27,7 +27,11 @@ fn series(store: &mut Store, name: &str, pairs: &[(&str, &str)], base: f64, incr
 
 fn fixture() -> Store {
     let mut store = Store::new(86_400);
-    let node_labels = [("kubernetes_node", NODE), ("instance", NODE)];
+    let node_labels = [
+        ("kubernetes_node", NODE),
+        ("instance", NODE),
+        ("node", NODE),
+    ];
 
     // 2000 total, 500 free, nothing in buffers or cache -> 1500 used.
     series(
@@ -66,6 +70,7 @@ fn fixture() -> Store {
         &[
             ("kubernetes_node", NODE),
             ("instance", NODE),
+            ("node", NODE),
             ("mode", "user"),
             ("cpu", "0"),
         ],
@@ -79,6 +84,7 @@ fn fixture() -> Store {
         &[
             ("kubernetes_node", NODE),
             ("instance", NODE),
+            ("node", NODE),
             ("mountpoint", "/"),
         ],
         100.0,
@@ -90,6 +96,7 @@ fn fixture() -> Store {
         &[
             ("kubernetes_node", NODE),
             ("instance", NODE),
+            ("node", NODE),
             ("mountpoint", "/"),
         ],
         40.0,
@@ -785,4 +792,74 @@ async fn a_malformed_match_argument_is_bad_data_not_a_panic() {
 
     assert_eq!(status, 422);
     assert_eq!(body["errorType"], "bad_data");
+}
+
+// -- the Helm grammar ---------------------------------------------------
+//
+// Lens' own provider is `isConfigurable: false`, so Lens will only ever
+// look for it at `lens-metrics/prometheus`. The Helm provider is
+// configurable -- it takes an explicit service address -- and its queries
+// differ from Lens' in eight of forty, every one of them a label rename
+// rather than a different shape. These assert the renamed ones, so the
+// daemon can be addressed anywhere and still answer.
+
+#[test]
+fn helm_queries_group_nodes_by_node_rather_than_kubernetes_node() {
+    let store = fixture();
+
+    // `by (component)` where Lens says `by (kubernetes_name)`: neither
+    // label exists here, so both fold to a single cluster-wide series.
+    assert_eq!(
+        one(
+            &store,
+            "sum(node_memory_MemTotal_bytes - (node_memory_MemFree_bytes + node_memory_Buffers_bytes + node_memory_Cached_bytes)) by (component)"
+        ),
+        1500.0
+    );
+
+    // Selecting and grouping on `node`, which only works because the
+    // series now carries it alongside `kubernetes_node`.
+    assert_eq!(
+        one(
+            &store,
+            "sum(node_filesystem_size_bytes{node=~\"node-a\", mountpoint=~\"/\"}) by (node)"
+        ),
+        100.0
+    );
+    assert_eq!(
+        one(
+            &store,
+            "sum(node_memory_MemTotal_bytes - (node_memory_MemFree_bytes + node_memory_Buffers_bytes + node_memory_Cached_bytes)) by (node)"
+        ),
+        1500.0
+    );
+}
+
+#[test]
+fn helm_node_cpu_reads_the_same_counter_over_a_five_minute_window() {
+    let store = fixture();
+
+    // Helm's rate accuracy is 5m against Lens' 1m. The fixture spans
+    // three minutes, so a 5m window covers all of it and the rate is the
+    // same underlying counter either way.
+    let lens = one(
+        &store,
+        "sum(rate(node_cpu_seconds_total{kubernetes_node=~\"node-a\", mode=~\"user|system\"}[1m]))",
+    );
+    let helm = one(
+        &store,
+        "sum(rate(node_cpu_seconds_total{node=~\"node-a\", mode=~\"user|system\"}[5m]))",
+    );
+    assert!(lens > 0.0, "the Lens form must produce a rate at all");
+    assert!(
+        (helm - lens).abs() < 1e-9,
+        "helm {helm} and lens {lens} read the same counter"
+    );
+
+    assert!(
+        one(
+            &store,
+            "sum(rate(node_cpu_seconds_total{mode=~\"user|system\"}[5m])) by(node)"
+        ) > 0.0
+    );
 }

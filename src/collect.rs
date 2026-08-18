@@ -145,9 +145,17 @@ fn collect_node_stats(
     images: &HashMap<(String, String, String), String>,
     now: i64,
 ) {
-    // Both labels carry the node name: Lens filters kubelet and cadvisor
-    // series on `instance` but groups node series by `kubernetes_node`.
-    let node_labels: [(&str, &str); 2] = [("kubernetes_node", node), ("instance", node)];
+    // Three names for one node, because the query grammar decides which
+    // one is read. Lens filters kubelet and cadvisor series on `instance`
+    // and groups node series by `kubernetes_node`; the Helm grammar uses
+    // `node` for both. Carrying all three is what lets the same series
+    // answer either provider -- and `node` is the one that makes the
+    // daemon addressable, since Helm is configurable and Lens is not.
+    let node_labels: [(&str, &str); 3] = [
+        ("kubernetes_node", node),
+        ("instance", node),
+        ("node", node),
+    ];
 
     if let Some(memory) = &stats.node.memory {
         let available = memory.available_bytes.unwrap_or(0.0);
@@ -182,6 +190,7 @@ fn collect_node_stats(
                 &[
                     ("kubernetes_node", node),
                     ("instance", node),
+                    ("node", node),
                     ("mode", "user"),
                     ("cpu", "0"),
                 ],
@@ -194,9 +203,10 @@ fn collect_node_stats(
     if let Some(fs) = &stats.node.fs {
         // Lens' default mountpoint filter is `/|/local`; the kubelet
         // reports one root filesystem, which is the `/` of that pair.
-        let fs_labels: [(&str, &str); 3] = [
+        let fs_labels: [(&str, &str); 4] = [
             ("kubernetes_node", node),
             ("instance", node),
+            ("node", node),
             ("mountpoint", "/"),
         ];
         if let Some(capacity) = fs.capacity_bytes {
