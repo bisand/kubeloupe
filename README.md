@@ -215,7 +215,7 @@ RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy`.
 ## Build
 
 ```sh
-docker build --platform linux/amd64 -t ghcr.io/bisand/lens-metricsd:0.2.2 .
+docker build --platform linux/amd64 -t lens-metricsd:dev .
 ```
 
 The builder is deliberately **not** pinned to `$BUILDPLATFORM`: it must run
@@ -227,11 +227,16 @@ cannot execute.
 `rust:alpine` targets musl natively, so the binary is static and the
 runtime image is `FROM scratch`: no base OS, nothing to patch.
 
+The tag above is `dev` on purpose. Released images are built and tagged by
+the release workflow from the git tag, so a version number written here
+would be one more place to remember, and silently wrong the first time it
+is forgotten.
+
 If you would rather not use a registry at all, import straight into the
 node's containerd and set `imagePullPolicy: Never`:
 
 ```sh
-docker save lens-metricsd:0.2.2 | ssh <node> 'sudo k3s ctr images import -'
+docker save lens-metricsd:dev | ssh <node> 'sudo k3s ctr images import -'
 ```
 
 ## Releases

@@ -23,6 +23,41 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # The quick start applies deploy/lens-metricsd.yaml straight from the
+  # default branch, so a release cut without bumping the image tag in it
+  # publishes an image nobody installs: everyone following the README keeps
+  # getting the previous version, and nothing says so. Checked before the
+  # build rather than after, so a forgotten bump costs a retag instead of a
+  # wrong image sitting on ghcr under the right name.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: The manifest must name the version being released
+        run: |
+          # workflow_dispatch runs from a branch, where there is no version
+          # to agree with. Skipped in the step rather than with `if:`, since
+          # a skipped job would skip everything that needs it.
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) echo "not a tag ref -- nothing to check"; exit 0 ;;
+          esac
+
+          version="${GITHUB_REF_NAME#v}"
+          pinned=$(grep -oE "image: ${IMAGE}:[^[:space:]]+" deploy/lens-metricsd.yaml | sed 's|.*:||' | sort -u)
+
+          if [ -z "$pinned" ]; then
+            echo "::error::deploy/lens-metricsd.yaml names no ${IMAGE} image"
+            exit 1
+          fi
+          if [ "$pinned" != "$version" ]; then
+            echo "::error::deploy/lens-metricsd.yaml pins '${pinned}', but v${version} is being released -- bump it, move the tag, and publish again"
+            exit 1
+          fi
+
+          echo "deploy/lens-metricsd.yaml pins ${pinned}"
+
   build:
     strategy:
       fail-fast: false
@@ -32,6 +67,7 @@ jobs:
             runner: ubuntu-latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+    needs: [verify]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
