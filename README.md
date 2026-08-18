@@ -176,7 +176,7 @@ RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy`.
 ## Build
 
 ```sh
-docker build --platform linux/amd64 -t ghcr.io/bisand/lens-metricsd:0.2.0 .
+docker build --platform linux/amd64 -t ghcr.io/bisand/lens-metricsd:0.2.1 .
 ```
 
 The builder is deliberately **not** pinned to `$BUILDPLATFORM`: it must run
@@ -192,7 +192,7 @@ If you would rather not use a registry at all, import straight into the
 node's containerd and set `imagePullPolicy: Never`:
 
 ```sh
-docker save lens-metricsd:0.2.0 | ssh <node> 'sudo k3s ctr images import -'
+docker save lens-metricsd:0.2.1 | ssh <node> 'sudo k3s ctr images import -'
 ```
 
 ## Tests
