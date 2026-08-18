@@ -23,18 +23,22 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  # The quick start applies deploy/lens-metricsd.yaml straight from the
-  # default branch, so a release cut without bumping the image tag in it
-  # publishes an image nobody installs: everyone following the README keeps
-  # getting the previous version, and nothing says so. Checked before the
-  # build rather than after, so a forgotten bump costs a retag instead of a
-  # wrong image sitting on ghcr under the right name.
+  # Every version written by hand must agree with the tag being released.
+  # The manifest is the one that bites: the quick start applies
+  # deploy/lens-metricsd.yaml straight from the default branch, so a release
+  # cut without bumping the image tag in it publishes an image nobody
+  # installs -- everyone following the README keeps getting the previous
+  # version, and nothing says so. Cargo.toml is cosmetic by comparison,
+  # nothing reads CARGO_PKG_VERSION, but it is checked for the same reason
+  # it is kept current: a version that disagrees reads as a mistake, and
+  # drift only grows. Checked before the build, so a forgotten bump costs a
+  # retag instead of a wrong image sitting on ghcr under the right name.
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: The manifest must name the version being released
+      - name: Every hand-written version must name the release
         run: |
           # workflow_dispatch runs from a branch, where there is no version
           # to agree with. Skipped in the step rather than with `if:`, since
@@ -56,7 +60,14 @@ jobs:
             exit 1
           fi
 
-          echo "deploy/lens-metricsd.yaml pins ${pinned}"
+          crate=$(grep -m1 '^version = ' Cargo.toml | sed 's|.*"\(.*\)".*|\1|')
+
+          if [ "$crate" != "$version" ]; then
+            echo "::error::Cargo.toml says '${crate}', but v${version} is being released -- bump it (and Cargo.lock, which carries it too), move the tag, and publish again"
+            exit 1
+          fi
+
+          echo "deploy/lens-metricsd.yaml pins ${pinned}, Cargo.toml says ${crate}"
 
   build:
     strategy:
