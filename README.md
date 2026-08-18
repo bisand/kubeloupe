@@ -117,6 +117,39 @@ because Lens interpolates node names; and node series must carry
 `kubernetes_node`, because Lens groups by it. Get these wrong and you have
 a working scrape with blank charts.
 
+### Reading it from something other than Lens
+
+Lens needs only `/api/v1/query` and `/api/v1/query_range`: it interpolates
+node, pod and namespace names it already holds from the Kubernetes API, so
+it never has to ask what exists. Anything else does, so the read-only
+discovery endpoints are answered too — `/api/v1/labels`,
+`/api/v1/series` and `/api/v1/label/{name}/values`, plus an empty
+`/api/v1/metadata`. Grafana's metric browser is one call to
+`label/__name__/values`, and a `label_values()` variable is one call to
+`label/{name}/values` and nothing more. They add no collection and no
+state — they read label sets the store already holds — for about 25 KiB
+compressed.
+
+What that does **not** buy is the rest of Prometheus. The PromQL subset is
+still the one Lens generates: selectors, `rate()`, `sum() by ()` and
+arithmetic. `avg`, `count`, `histogram_quantile`, `topk`, `offset` and
+subqueries are a 422, so a prebuilt Kubernetes dashboard will mostly not
+render — it expects both the functions and the full
+kube-state-metrics/node-exporter catalogue. Hand-written panels within the
+subset work.
+
+`/api/v1/status/buildinfo` is deliberately **not** answered. Grafana probes
+it to decide which PromQL features to send, and a 404 makes it assume the
+conservative subset — which is the truth here. Answering it with a version
+number would advertise functions the parser rejects.
+
+Some values are also chosen so that the *arithmetic Lens performs* comes
+out right, which is not the same as each series being independently
+truthful: `node_memory_Buffers_bytes` and `node_memory_Cached_bytes` are
+published as zero, and `MemTotal` as capacity, so that Lens' `MemTotal -
+(MemFree + Buffers + Cached)` yields the working set. A tool that computes
+memory a different way gets a wrong number, not a missing one.
+
 ## What it does not cover
 
 - **Per-container disk read/write rates.** `container_fs_reads_bytes_total`
