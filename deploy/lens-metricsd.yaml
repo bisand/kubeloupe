@@ -90,7 +90,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: lens-metricsd
-          image: ghcr.io/bisand/lens-metricsd:0.2.2
+          image: ghcr.io/bisand/lens-metricsd:0.2.3
           # IfNotPresent rather than Always: the node already holds this
           # tag, so a restart never depends on the registry being
           # reachable -- but a rebuilt node can still pull it.
