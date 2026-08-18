@@ -1,5 +1,12 @@
-# Publishes the image on a version tag, so a release stops depending on
-# whoever last ran `docker build` on a laptop.
+# Publishes the image when a GitHub release is PUBLISHED, not merely when
+# a tag is pushed. A tag is a bookmark and is cheap to push by accident or
+# to move while preparing something; a release is a deliberate act with
+# notes attached. Tying the image to the release means what is on ghcr
+# always corresponds to something a human decided to ship and wrote a
+# changelog for.
+#
+# Publishing a release still requires a tag, so `type=semver` below reads
+# the version from `github.ref` exactly as before.
 #
 # Built per-architecture on native runners and merged into one manifest
 # afterwards. Emulating an arm64 Rust build under QEMU takes tens of
@@ -8,8 +15,8 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 env:
