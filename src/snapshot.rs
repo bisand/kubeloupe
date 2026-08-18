@@ -157,7 +157,7 @@ fn read_string(input: &mut impl Read) -> Result<String> {
     }
     let mut buf = vec![0u8; len as usize];
     input.read_exact(&mut buf)?;
-    Ok(String::from_utf8(buf).context("a label was not valid UTF-8")?)
+    String::from_utf8(buf).context("a label was not valid UTF-8")
 }
 
 macro_rules! read_le {
