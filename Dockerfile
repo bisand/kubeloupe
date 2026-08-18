@@ -15,6 +15,12 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM scratch
+# GitHub links a ghcr package to a repository by this label. Without it
+# the package attaches to whichever repo it was first connected to by
+# hand, which is how it can end up filed under an unrelated project.
+LABEL org.opencontainers.image.source="https://github.com/bisand/lens-metricsd"
+LABEL org.opencontainers.image.description="Metrics for Lens Desktop in one static binary: reads the Kubernetes API and kubelet directly, serves the PromQL subset Lens generates."
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 # `strip` is left out on purpose, matching postbud: a panic in production
 # still names functions in the backtrace, for about 1 MB.
 COPY --from=builder /src/target/release/lens-metricsd /lens-metricsd
