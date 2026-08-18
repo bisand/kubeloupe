@@ -115,10 +115,7 @@ async fn main() -> Result<()> {
     if let Some(path) = &config.snapshot_path {
         let guard = store.read().await;
         match snapshot::save(&guard, path) {
-            Ok(()) => eprintln!(
-                "kubeloupe: final snapshot written to {}",
-                path.display()
-            ),
+            Ok(()) => eprintln!("kubeloupe: final snapshot written to {}", path.display()),
             Err(error) => eprintln!("kubeloupe: final snapshot failed: {error:#}"),
         }
     }
