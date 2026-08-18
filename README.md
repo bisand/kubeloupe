@@ -1,10 +1,10 @@
-# lens-metricsd
+# kubeloupe
 
 **Metrics for [Lens Desktop](https://k8slens.dev) in one static binary.**
 No Prometheus, no node-exporter, no kube-state-metrics.
 
-[![ci](https://github.com/bisand/lens-metricsd/actions/workflows/ci.yml/badge.svg)](https://github.com/bisand/lens-metricsd/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/bisand/lens-metricsd?sort=semver)](https://github.com/bisand/lens-metricsd/releases)
+[![ci](https://github.com/bisand/kubeloupe/actions/workflows/ci.yml/badge.svg)](https://github.com/bisand/kubeloupe/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/bisand/kubeloupe?sort=semver)](https://github.com/bisand/kubeloupe/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Image size](https://img.shields.io/badge/image-2%20MB-green)
 
@@ -21,7 +21,7 @@ actually generates.
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
 | VictoriaMetrics + node-exporter + kube-state-metrics | 50.6 MB | ~170 MB |
-| **lens-metricsd** | **2.0 MB** | **~10 MiB** |
+| **kubeloupe** | **2.0 MB** | **~10 MiB** |
 
 Measured on a single-node k3s box (1 core, 2 GB) running ~10 pods and 136
 series: **1.5 MiB after an hour, 0.2 millicores**, with a 219 KiB snapshot
@@ -37,7 +37,7 @@ monitoring stack costs more than the workloads it watches.
 ## Quick start
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/bisand/lens-metricsd/main/deploy/lens-metricsd.yaml
+kubectl apply -f https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
 ```
 
 That creates a `lens-metrics` namespace, a read-only ServiceAccount, one
@@ -46,7 +46,9 @@ Deployment, and a Service named `prometheus`.
 **The Service name and namespace are load-bearing.** Lens' built-in
 provider does a literal lookup of the Service `prometheus` in namespace
 `lens-metrics` and takes `ports[0].port`. Rename either and Lens stops
-finding it.
+finding it. That is why the namespace still reads `lens-metrics` while
+everything else reads `kubeloupe`: those two strings are an address Lens
+dictates, not names this project chose.
 
 Then configure Lens — see below. Charts need about two minutes of samples
 before a `rate()` has anything to draw.
@@ -168,6 +170,29 @@ memory a different way gets a wrong number, not a missing one.
   one replica: a second would hold a different history and the Service
   would alternate between them.
 
+## Upgrading from lens-metricsd
+
+The project was called `lens-metricsd` up to 0.2.3. The namespace and the
+Service keep their names — Lens dictates those — but the Deployment,
+ServiceAccount, ClusterRole, PVC and labels are all now `kubeloupe`, so
+applying the new manifest **creates** those alongside the old ones rather
+than replacing them:
+
+```sh
+kubectl apply -f https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
+kubectl -n lens-metrics delete deploy,sa,pvc lens-metricsd
+kubectl delete clusterrole,clusterrolebinding lens-metricsd
+```
+
+The `Service` selector moves to the new label the moment the manifest is
+applied, so Lens follows the new pod immediately; the old one keeps
+scraping until it is deleted, which is the only reason to hurry.
+
+A day of history stays behind on the old PVC. The snapshot format did not
+change — the file's magic still reads `LMD1` — so if the history matters,
+copy `snapshot.bin` from the old volume to the new one before starting the
+new pod. Otherwise the new pod starts empty and refills within the hour.
+
 ## Persistence
 
 The store is in memory, but it is snapshotted to disk so a restart does
@@ -215,7 +240,7 @@ RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy`.
 ## Build
 
 ```sh
-docker build --platform linux/amd64 -t lens-metricsd:dev .
+docker build --platform linux/amd64 -t kubeloupe:dev .
 ```
 
 The builder is deliberately **not** pinned to `$BUILDPLATFORM`: it must run
@@ -236,7 +261,7 @@ If you would rather not use a registry at all, import straight into the
 node's containerd and set `imagePullPolicy: Never`:
 
 ```sh
-docker save lens-metricsd:dev | ssh <node> 'sudo k3s ctr images import -'
+docker save kubeloupe:dev | ssh <node> 'sudo k3s ctr images import -'
 ```
 
 ## Releases

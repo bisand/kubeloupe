@@ -39,7 +39,7 @@ impl Client {
 
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
-            .user_agent("lens-metricsd");
+            .user_agent("kubeloupe");
 
         for cert in reqwest::Certificate::from_pem_bundle(&ca)? {
             builder = builder.add_root_certificate(cert);

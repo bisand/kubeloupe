@@ -6,7 +6,7 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: lens-metricsd
+  name: kubeloupe
   namespace: lens-metrics
 ---
 # Read-only, and narrow: Node and Pod objects supply capacity, requests
@@ -16,7 +16,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: lens-metricsd
+  name: kubeloupe
 rules:
   - apiGroups: [""]
     resources: ["nodes", "pods"]
@@ -28,14 +28,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: lens-metricsd
+  name: kubeloupe
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: lens-metricsd
+  name: kubeloupe
 subjects:
   - kind: ServiceAccount
-    name: lens-metricsd
+    name: kubeloupe
     namespace: lens-metrics
 ---
 # 64Mi against a snapshot of ~6 MB at the default 24h retention. No
@@ -43,7 +43,7 @@ subjects:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: lens-metricsd
+  name: kubeloupe
   namespace: lens-metrics
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -54,10 +54,10 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: lens-metricsd
+  name: kubeloupe
   namespace: lens-metrics
   labels:
-    app.kubernetes.io/name: lens-metricsd
+    app.kubernetes.io/name: kubeloupe
 spec:
   # Exactly one. The series live in the process, so a second replica
   # would hold a different history and the Service would alternate
@@ -70,13 +70,13 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: lens-metricsd
+      app.kubernetes.io/name: kubeloupe
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: lens-metricsd
+        app.kubernetes.io/name: kubeloupe
     spec:
-      serviceAccountName: lens-metricsd
+      serviceAccountName: kubeloupe
       securityContext:
         runAsUser: 65534
         runAsGroup: 65534
@@ -89,8 +89,8 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: lens-metricsd
-          image: ghcr.io/bisand/lens-metricsd:0.2.3
+        - name: kubeloupe
+          image: ghcr.io/bisand/kubeloupe:0.2.3
           # IfNotPresent rather than Always: the node already holds this
           # tag, so a restart never depends on the registry being
           # reachable -- but a rebuilt node can still pull it.
@@ -105,7 +105,7 @@ spec:
             # Unset would disable persistence. This path is the mounted
             # volume below.
             - name: SNAPSHOT_PATH
-              value: /var/lib/lens-metricsd/snapshot.bin
+              value: /var/lib/kubeloupe/snapshot.bin
             # The upper bound on history lost to an UNCLEAN kill. A
             # rollout or any other SIGTERM writes a final snapshot and
             # costs nothing.
@@ -130,7 +130,7 @@ spec:
             # ROOT filesystem read-only, and mounted volumes stay
             # writable, so persistence costs none of the hardening.
             - name: snapshot
-              mountPath: /var/lib/lens-metricsd
+              mountPath: /var/lib/kubeloupe
           resources:
             requests:
               cpu: 20m
@@ -148,7 +148,7 @@ spec:
       volumes:
         - name: snapshot
           persistentVolumeClaim:
-            claimName: lens-metricsd
+            claimName: kubeloupe
 ---
 # The name and namespace are load-bearing. Lens' built-in "Lens" provider
 # does a literal lookup of the Service named `prometheus` in namespace
@@ -160,10 +160,10 @@ metadata:
   name: prometheus
   namespace: lens-metrics
   labels:
-    app.kubernetes.io/name: lens-metricsd
+    app.kubernetes.io/name: kubeloupe
 spec:
   selector:
-    app.kubernetes.io/name: lens-metricsd
+    app.kubernetes.io/name: kubeloupe
   ports:
     - name: http
       port: 80

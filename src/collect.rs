@@ -119,15 +119,15 @@ pub async fn collect(client: &Client, store: &mut Store, now: i64) -> anyhow::Re
             Ok(stats) => {
                 collect_node_stats(store, name, &stats, &images, now);
                 store.append(
-                    labels("up", &[("instance", name), ("job", "lens-metricsd")]),
+                    labels("up", &[("instance", name), ("job", "kubeloupe")]),
                     now,
                     1.0,
                 );
             }
             Err(error) => {
-                eprintln!("lens-metricsd: stats/summary for node {name} failed: {error:#}");
+                eprintln!("kubeloupe: stats/summary for node {name} failed: {error:#}");
                 store.append(
-                    labels("up", &[("instance", name), ("job", "lens-metricsd")]),
+                    labels("up", &[("instance", name), ("job", "kubeloupe")]),
                     now,
                     0.0,
                 );

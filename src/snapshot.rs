@@ -27,6 +27,11 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+// "LensMetricsD v1", from before the rename. Deliberately left alone: the
+// magic identifies the on-disk format, not the project, and changing it
+// would make every existing snapshot unreadable -- which the loader
+// handles gracefully, by starting empty and throwing away the day of
+// history it was written to preserve.
 const MAGIC: &[u8; 4] = b"LMD1";
 const VERSION: u16 = 1;
 
@@ -93,7 +98,7 @@ pub fn load(path: &Path, retention: i64, now: i64) -> Result<Store> {
     let mut magic = [0u8; 4];
     input.read_exact(&mut magic).context("reading the header")?;
     if &magic != MAGIC {
-        bail!("not a lens-metricsd snapshot");
+        bail!("not a kubeloupe snapshot");
     }
     let version = read_u16(&mut input)?;
     if version != VERSION {

@@ -564,7 +564,7 @@ fn series_that_stop_reporting_are_dropped_entirely() {
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("lens-metricsd-test-{name}-{}", std::process::id()));
+    p.push(format!("kubeloupe-test-{name}-{}", std::process::id()));
     p.push("snapshot.bin");
     p
 }

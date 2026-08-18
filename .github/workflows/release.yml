@@ -25,7 +25,7 @@ env:
 jobs:
   # Every version written by hand must agree with the tag being released.
   # The manifest is the one that bites: the quick start applies
-  # deploy/lens-metricsd.yaml straight from the default branch, so a release
+  # deploy/kubeloupe.yaml straight from the default branch, so a release
   # cut without bumping the image tag in it publishes an image nobody
   # installs -- everyone following the README keeps getting the previous
   # version, and nothing says so. Cargo.toml is cosmetic by comparison,
@@ -49,14 +49,14 @@ jobs:
           esac
 
           version="${GITHUB_REF_NAME#v}"
-          pinned=$(grep -oE "image: ${IMAGE}:[^[:space:]]+" deploy/lens-metricsd.yaml | sed 's|.*:||' | sort -u)
+          pinned=$(grep -oE "image: ${IMAGE}:[^[:space:]]+" deploy/kubeloupe.yaml | sed 's|.*:||' | sort -u)
 
           if [ -z "$pinned" ]; then
-            echo "::error::deploy/lens-metricsd.yaml names no ${IMAGE} image"
+            echo "::error::deploy/kubeloupe.yaml names no ${IMAGE} image"
             exit 1
           fi
           if [ "$pinned" != "$version" ]; then
-            echo "::error::deploy/lens-metricsd.yaml pins '${pinned}', but v${version} is being released -- bump it, move the tag, and publish again"
+            echo "::error::deploy/kubeloupe.yaml pins '${pinned}', but v${version} is being released -- bump it, move the tag, and publish again"
             exit 1
           fi
 
@@ -67,7 +67,7 @@ jobs:
             exit 1
           fi
 
-          echo "deploy/lens-metricsd.yaml pins ${pinned}, Cargo.toml says ${crate}"
+          echo "deploy/kubeloupe.yaml pins ${pinned}, Cargo.toml says ${crate}"
 
   build:
     strategy:

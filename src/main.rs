@@ -1,4 +1,4 @@
-//! lens-metricsd -- the whole metrics backend for Lens in one process.
+//! kubeloupe -- the whole metrics backend for Lens in one process.
 //!
 //! Lens will not draw a chart without a Prometheus-compatible query API,
 //! and the usual way to get one on a small cluster costs a Prometheus, a
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     eprintln!(
-        "lens-metricsd: listening on {}, scraping every {}s, keeping {}h, snapshot {}",
+        "kubeloupe: listening on {}, scraping every {}s, keeping {}h, snapshot {}",
         config.listen,
         config.scrape_interval,
         config.retention / 3600,
@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     let server = axum::serve(listener, api::router(Arc::clone(&store)));
     tokio::select! {
         result = server => result?,
-        _ = shutdown_signal() => eprintln!("lens-metricsd: shutting down"),
+        _ = shutdown_signal() => eprintln!("kubeloupe: shutting down"),
     }
 
     // Stopping the collector first means nothing is mid-write below.
@@ -116,10 +116,10 @@ async fn main() -> Result<()> {
         let guard = store.read().await;
         match snapshot::save(&guard, path) {
             Ok(()) => eprintln!(
-                "lens-metricsd: final snapshot written to {}",
+                "kubeloupe: final snapshot written to {}",
                 path.display()
             ),
-            Err(error) => eprintln!("lens-metricsd: final snapshot failed: {error:#}"),
+            Err(error) => eprintln!("kubeloupe: final snapshot failed: {error:#}"),
         }
     }
 
@@ -137,7 +137,7 @@ fn restore(config: &Config) -> store::Store {
     match snapshot::load(path, config.retention, now()) {
         Ok(store) => {
             eprintln!(
-                "lens-metricsd: restored {} series and {} samples from {}",
+                "kubeloupe: restored {} series and {} samples from {}",
                 store.series_count(),
                 store.sample_count(),
                 path.display(),
@@ -149,7 +149,7 @@ fn restore(config: &Config) -> store::Store {
         // file is worse than one that starts empty.
         Err(error) => {
             eprintln!(
-                "lens-metricsd: ignoring unreadable snapshot {}: {error:#}",
+                "kubeloupe: ignoring unreadable snapshot {}: {error:#}",
                 path.display()
             );
             store::Store::new(config.retention)
@@ -179,7 +179,7 @@ async fn collector_loop(
             // a wait Lens never notices.
             let mut guard = store.write().await;
             if let Err(error) = collect::collect(&client, &mut guard, started).await {
-                eprintln!("lens-metricsd: collection failed: {error:#}");
+                eprintln!("kubeloupe: collection failed: {error:#}");
             }
             // Outside the error path on purpose. Pruning used to be the
             // last line of collect(), which meant an API server outage --
@@ -199,7 +199,7 @@ async fn collector_loop(
             Ok(()) => last_snapshot = started,
             // Keep serving from memory and try again next time: a full or
             // unwritable volume should not take the metrics down.
-            Err(error) => eprintln!("lens-metricsd: snapshot failed: {error:#}"),
+            Err(error) => eprintln!("kubeloupe: snapshot failed: {error:#}"),
         }
     }
 }

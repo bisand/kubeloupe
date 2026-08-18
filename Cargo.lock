@@ -467,7 +467,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lens-metricsd"
+name = "kubeloupe"
 version = "0.2.3"
 dependencies = [
  "anyhow",
