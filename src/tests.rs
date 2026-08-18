@@ -465,3 +465,71 @@ fn kubernetes_quantities_parse() {
     assert_eq!(parse_quantity("110"), Some(110.0));
     assert_eq!(parse_quantity(""), None);
 }
+
+// --- boundedness ------------------------------------------------------------
+//
+// The store is memory-only and never touches disk, so "does it grow without
+// limit" is the whole safety question. These assert the two ways it could.
+
+#[test]
+fn the_store_is_bounded_by_retention_however_long_it_runs() {
+    const RETENTION: i64 = 3_600; // 1h
+    const INTERVAL: i64 = 30;
+    let mut store = Store::new(RETENTION);
+    let container =
+        [("namespace", "app"), ("pod", "api-1"), ("container", "api"), ("image", "x")];
+
+    // Ten retention windows of continuous collection.
+    let mut peak = 0;
+    let mut t = 0;
+    while t < RETENTION * 10 {
+        store.append(labels("container_memory_working_set_bytes", &container), t, 1.0);
+        store.append(labels("kubelet_running_pods", &[("instance", NODE)]), t, 5.0);
+        store.prune(t);
+        peak = peak.max(store.sample_count());
+        t += INTERVAL;
+    }
+
+    // Two series, each holding at most one retention window of samples.
+    let ceiling = 2 * (RETENTION / INTERVAL + 1) as usize;
+    assert_eq!(store.series_count(), 2);
+    assert!(
+        peak <= ceiling,
+        "peak {peak} samples exceeded the retention ceiling of {ceiling}"
+    );
+    // And it really did fill up rather than staying trivially small.
+    assert!(peak > ceiling / 2, "expected the window to fill, peaked at {peak}");
+}
+
+#[test]
+fn series_that_stop_reporting_are_dropped_entirely() {
+    const RETENTION: i64 = 600;
+    let mut store = Store::new(RETENTION);
+
+    // A pod that exists briefly, as happens on every rollout.
+    for t in (0..300).step_by(30) {
+        store.append(
+            labels("container_memory_working_set_bytes", &[
+                ("namespace", "app"),
+                ("pod", "doomed-1"),
+                ("container", "api"),
+                ("image", "x"),
+            ]),
+            t,
+            1.0,
+        );
+    }
+    assert_eq!(store.series_count(), 1);
+
+    // Long after its last sample, the series -- and its name index entry --
+    // must be gone, not just empty. Churning pods would otherwise
+    // accumulate for the life of the process.
+    store.prune(1_000);
+    assert_eq!(store.series_count(), 0, "an aged-out series should be removed");
+    assert_eq!(store.sample_count(), 0);
+
+    // The name index must have been cleaned too: re-appending has to
+    // produce exactly one series, not attach to a stale key.
+    store.append(labels("kubelet_running_pods", &[("instance", NODE)]), 1_030, 1.0);
+    assert_eq!(store.series_count(), 1);
+}

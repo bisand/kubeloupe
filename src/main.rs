@@ -65,6 +65,13 @@ async fn main() -> Result<()> {
                 if let Err(error) = collect::collect(&client, &mut guard, started).await {
                     eprintln!("lens-metricsd: collection failed: {error:#}");
                 }
+                // Outside the error path on purpose. Pruning used to be the
+                // last line of collect(), which meant an API server outage
+                // -- exactly when collection returns early -- also stopped
+                // anything ageing out. Nothing is appended then either, so
+                // it never grew, but the retention bound simply stopped
+                // being enforced until the next successful pass.
+                guard.prune(started);
             }
         }
     };

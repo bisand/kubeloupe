@@ -135,7 +135,6 @@ pub async fn collect(client: &Client, store: &mut Store, now: i64) -> anyhow::Re
         }
     }
 
-    store.prune(now);
     Ok(())
 }
 
