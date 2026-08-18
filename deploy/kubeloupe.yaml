@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: lens-metrics
+  name: kubeloupe
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: kubeloupe
-  namespace: lens-metrics
+  namespace: kubeloupe
 ---
 # Read-only, and narrow: Node and Pod objects supply capacity, requests
 # and limits, and nodes/proxy reaches each kubelet's /stats/summary
@@ -36,7 +36,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: kubeloupe
-    namespace: lens-metrics
+    namespace: kubeloupe
 ---
 # 64Mi against a snapshot of ~6 MB at the default 24h retention. No
 # storageClassName, so it takes the cluster default (local-path on k3s).
@@ -44,7 +44,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: kubeloupe
-  namespace: lens-metrics
+  namespace: kubeloupe
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:
@@ -55,7 +55,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kubeloupe
-  namespace: lens-metrics
+  namespace: kubeloupe
   labels:
     app.kubernetes.io/name: kubeloupe
 spec:
@@ -150,15 +150,18 @@ spec:
           persistentVolumeClaim:
             claimName: kubeloupe
 ---
-# The name and namespace are load-bearing. Lens' built-in "Lens" provider
-# does a literal lookup of the Service named `prometheus` in namespace
-# `lens-metrics` and takes ports[0].port -- match both and Lens
-# auto-detects with no configuration at all.
+# Lens' built-in "Lens" provider auto-detects one pair and only that pair:
+# a Service named `prometheus` in namespace `lens-metrics`, fixed strings,
+# no search. These are neither, so auto-detection will not find this --
+# set PROMETHEUS SERVICE ADDRESS to `kubeloupe/kubeloupe:80` in Cluster
+# Settings, which makes Lens skip detection entirely. Renaming this
+# Service back to `prometheus` in a `lens-metrics` namespace is all it
+# takes to get the zero-configuration behaviour back.
 apiVersion: v1
 kind: Service
 metadata:
-  name: prometheus
-  namespace: lens-metrics
+  name: kubeloupe
+  namespace: kubeloupe
   labels:
     app.kubernetes.io/name: kubeloupe
 spec:
