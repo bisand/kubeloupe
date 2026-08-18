@@ -34,6 +34,7 @@ pub fn router(store: Shared) -> Router {
         .route("/api/v1/query", get(instant_get).post(instant_post))
         .route("/health", get(health))
         .route("/-/stats", get(stats))
+        .merge(crate::discovery::router())
         .with_state(store)
 }
 
@@ -171,7 +172,7 @@ fn success_scalar(value: serde_json::Value) -> Response {
     .into_response()
 }
 
-fn bad_data(message: &str) -> Response {
+pub(crate) fn bad_data(message: &str) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({ "status": "error", "errorType": "bad_data", "error": message })),

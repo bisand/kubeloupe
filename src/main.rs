@@ -9,6 +9,7 @@
 
 mod api;
 mod collect;
+mod discovery;
 mod kube;
 mod promql;
 mod snapshot;

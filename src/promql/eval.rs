@@ -133,7 +133,7 @@ pub fn eval(store: &Store, expr: &Expr, t: i64) -> Value {
     }
 }
 
-fn select<'a>(store: &'a Store, selector: &Selector) -> Vec<&'a crate::store::Series> {
+pub(crate) fn select<'a>(store: &'a Store, selector: &Selector) -> Vec<&'a crate::store::Series> {
     store
         .candidates(selector.name.as_deref())
         .into_iter()

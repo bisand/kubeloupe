@@ -683,3 +683,106 @@ fn a_snapshot_overwrites_the_previous_one_in_place() {
 
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+// -- discovery ---------------------------------------------------------
+//
+// Lens never calls these. Grafana's metric browser is one call to
+// `label/__name__/values`, and a `label_values(...)` variable is one call
+// to `label/{name}/values` -- so these tests are the whole of what makes
+// this readable from something other than Lens.
+
+fn app() -> axum::Router {
+    crate::api::router(std::sync::Arc::new(tokio::sync::RwLock::new(fixture())))
+}
+
+async fn get(uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+
+    let response = app()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn the_metric_browser_can_list_every_metric_name() {
+    let (status, body) = get("/api/v1/label/__name__/values").await;
+
+    assert_eq!(status, 200);
+    let names = body["data"].as_array().unwrap();
+    assert!(names.contains(&serde_json::json!("node_memory_MemTotal_bytes")));
+    assert!(names.contains(&serde_json::json!("container_cpu_usage_seconds_total")));
+}
+
+#[tokio::test]
+async fn a_label_values_variable_narrows_to_the_selector_it_was_given() {
+    // What `label_values(kube_pod_container_resource_requests, pod)`
+    // sends. Without the match[] it would return every pod in the store,
+    // which is the failure mode where a Grafana dropdown quietly lists
+    // pods that have no such series.
+    let (status, body) =
+        get("/api/v1/label/pod/values?match%5B%5D=kube_pod_container_resource_requests").await;
+
+    assert_eq!(status, 200);
+    let pods = body["data"].as_array().unwrap();
+    assert!(!pods.is_empty());
+
+    let (_, all) = get("/api/v1/label/pod/values").await;
+    assert!(all["data"].as_array().unwrap().len() >= pods.len());
+}
+
+#[tokio::test]
+async fn labels_lists_the_label_names_and_series_needs_a_selector() {
+    let (status, body) = get("/api/v1/labels").await;
+    assert_eq!(status, 200);
+    let names = body["data"].as_array().unwrap();
+    assert!(names.contains(&serde_json::json!("kubernetes_node")));
+    assert!(names.contains(&serde_json::json!("__name__")));
+
+    // Prometheus rejects a bare /series rather than serialising the whole
+    // store, and 422 is what the rest of this API answers for bad_data.
+    let (status, _) = get("/api/v1/series").await;
+    assert_eq!(status, 422);
+}
+
+#[tokio::test]
+async fn a_series_that_stopped_before_the_window_is_not_offered() {
+    // The fixture ends at LAST. A dashboard asking about now would
+    // otherwise keep offering a node drained a day ago for as long as
+    // retention holds its samples.
+    let (status, body) = get(&format!(
+        "/api/v1/series?match%5B%5D=node_memory_MemTotal_bytes&start={}",
+        LAST + 1
+    ))
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body["data"].as_array().unwrap().is_empty());
+
+    let (_, body) = get(&format!(
+        "/api/v1/series?match%5B%5D=node_memory_MemTotal_bytes&start={}&end={}",
+        FIRST, LAST
+    ))
+    .await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["kubernetes_node"], NODE);
+}
+
+#[tokio::test]
+async fn a_malformed_match_argument_is_bad_data_not_a_panic() {
+    let (status, body) = get("/api/v1/labels?match%5B%5D=sum(rate(x%5B1m%5D))").await;
+
+    assert_eq!(status, 422);
+    assert_eq!(body["errorType"], "bad_data");
+}

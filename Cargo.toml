@@ -14,6 +14,10 @@ panic = "abort"
 
 [dependencies]
 anyhow = "1"
+# Already in the tree under reqwest's `url`; naming it directly adds no code,
+# and repeated `match[]` parameters need it -- serde_urlencoded keeps only
+# the last occurrence of a repeated key.
+form_urlencoded = "1"
 # Only ever talks to the API server, over one connection, with the
 # ServiceAccount CA supplied explicitly -- hence manual-roots rather than
 # a bundled root store the scratch image would otherwise have to carry.
@@ -44,3 +48,7 @@ axum = { version = "0.8", default-features = false, features = [
     "json",
     "form",
 ] }
+
+[dev-dependencies]
+# Already present under axum -- dev-only, so the shipped binary is unchanged.
+tower = { version = "0.5", features = ["util"] }
