@@ -81,11 +81,39 @@ daemon exists to replace.
 
 ### If you would rather have your own namespace
 
-Nothing in the daemon depends on either name — they are there so Lens'
-detection works. To run it as `kubeloupe` instead, edit
-`deploy/kubeloupe.yaml` before applying: set the `Namespace`'s name and
-every `namespace:` field to `kubeloupe`, and the `Service`'s name to
-`kubeloupe`. Change nothing else.
+Nothing in the daemon depends on either name — they are chosen so Lens'
+detection works. To run it in a `kubeloupe` namespace instead, there is a
+kustomize overlay in [`deploy/own-namespace`](deploy/own-namespace):
+
+```sh
+kubectl apply -k https://github.com/bisand/kubeloupe//deploy/own-namespace?ref=main
+```
+
+It is twelve lines, and it builds on the same manifest rather than copying
+it:
+
+```yaml
+resources:
+  - https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
+
+namespace: kubeloupe
+
+patches:
+  - target:
+      kind: Service
+      name: prometheus
+    patch: |
+      - op: replace
+        path: /metadata/name
+        value: kubeloupe
+```
+
+`namespace:` moves every namespaced resource, renames the `Namespace`
+object itself, and — the part worth having a tool do — rewrites the
+`ClusterRoleBinding`'s subject to match. A subject left pointing at the old
+namespace is a silent 403: the daemon runs, scrapes nothing, and says so
+only in its log. Swap `main` for a tag such as `v0.2.7` in both places to
+pin the version.
 
 Lens then needs a third setting, because auto-detection will no longer find
 it: set **PROMETHEUS** to `Helm` and **PROMETHEUS SERVICE ADDRESS** to

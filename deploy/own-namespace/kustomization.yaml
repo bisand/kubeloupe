@@ -1,0 +1,28 @@
+# Runs kubeloupe in a namespace named after itself, instead of the
+# `lens-metrics` namespace the default manifest uses so that Lens'
+# detection finds it.
+#
+#   kubectl apply -k deploy/own-namespace
+#
+# Lens then needs to be told where to look and which grammar to speak:
+# set PROMETHEUS to `Helm` and PROMETHEUS SERVICE ADDRESS to
+# `kubeloupe/kubeloupe:80`. See the README.
+# The URL rather than `../kubeloupe.yaml`: kustomize refuses to load files
+# above its own directory, and a remote resource keeps this overlay in step
+# with the manifest instead of duplicating it.
+resources:
+  - https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
+
+# Renames the Namespace object as well as every namespaced resource, and
+# moves the ClusterRoleBinding's subject with them -- a subject left
+# pointing at the old namespace is a silent 403, not an error.
+namespace: kubeloupe
+
+patches:
+  - target:
+      kind: Service
+      name: prometheus
+    patch: |
+      - op: replace
+        path: /metadata/name
+        value: kubeloupe
