@@ -90,7 +90,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kubeloupe
-          image: ghcr.io/bisand/kubeloupe:0.2.7
+          image: ghcr.io/bisand/kubeloupe:0.2.8
           # IfNotPresent rather than Always: the node already holds this
           # tag, so a restart never depends on the registry being
           # reachable -- but a rebuilt node can still pull it.
