@@ -1,0 +1,31 @@
+# Pins the snapshot volume to a named StorageClass instead of taking the
+# cluster default.
+#
+#   kubectl apply -k https://github.com/bisand/kubeloupe//deploy/pinned-storage?ref=main
+#
+# Two reasons this exists, both met on real clusters:
+#
+#   - More than one StorageClass annotated as default. Kubernetes then
+#     picks the most recently created one and warns, so an unspecified
+#     class silently resolves to whichever was added last -- which may be
+#     a `Retain` class that leaves the volume behind when the claim goes.
+#
+#   - More than one node. A node-local class such as k3s' `local-path`
+#     strands the snapshot on whichever node first scheduled the pod, so a
+#     reschedule quietly starts from an empty store. A replicated class
+#     follows the pod.
+#
+# `longhorn` is the value here because that is what the clusters this was
+# written for run. Change it to whatever the cluster provides -- the
+# daemon does not care, and 64Mi is the whole requirement.
+resources:
+  - https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
+
+patches:
+  - target:
+      kind: PersistentVolumeClaim
+      name: kubeloupe
+    patch: |
+      - op: add
+        path: /spec/storageClassName
+        value: longhorn

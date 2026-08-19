@@ -295,6 +295,33 @@ perfectly, so it surfaces only as history that never survives.
 `readOnlyRootFilesystem: true` still applies: it covers the *root*
 filesystem, and mounted volumes stay writable.
 
+The PVC names no `storageClassName`, so it takes the cluster default. On
+two kinds of cluster that is the wrong thing to leave to chance, and
+[`deploy/pinned-storage`](deploy/pinned-storage) pins it instead:
+
+```sh
+kubectl apply -k https://github.com/bisand/kubeloupe//deploy/pinned-storage?ref=main
+```
+
+**More than one default.** Kubernetes allows several StorageClasses to
+carry the default annotation; it then picks the most recently created and
+warns. An unspecified class therefore resolves to whichever was added last
+— which may be a `Retain` class that leaves the volume behind every time
+the claim is deleted. Worth checking with `kubectl get sc` before
+installing: more than one `(default)` is a cluster-wide latent bug, not
+just one for this daemon.
+
+**More than one node.** A node-local class such as k3s' `local-path`
+strands the snapshot on whichever node first scheduled the pod, so a
+reschedule quietly starts from an empty store — the daemon runs perfectly
+and simply has no history, which is the same failure shape as the `EACCES`
+one above. A replicated class follows the pod.
+
+The overlay pins `longhorn`; change the value for whatever the cluster
+provides. Storage class is immutable on an existing claim, so this has to
+be right at creation — an already-bound PVC keeps its class no matter what
+the manifest says later.
+
 ## Configuration
 
 | variable | default | |
