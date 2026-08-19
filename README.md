@@ -83,6 +83,28 @@ Leave the **Lens Metrics** page's three toggles (bundled Prometheus,
 kube-state-metrics, node-exporter) **off**. Those install the stack this
 daemon exists to replace.
 
+### If you would rather configure nothing
+
+Lens finds a Service named `prometheus` in namespace `lens-metrics` without
+being told, because that is where Lens installs its **own** bundled
+Prometheus. The lookup is Lens finding its own stack, not discovering third
+parties — which is why it is hardcoded and why that provider takes no
+address. Sitting at that address makes this daemon auto-detect too.
+
+Before applying, edit `deploy/kubeloupe.yaml`: set the `Namespace`'s name
+and every `namespace:` field to `lens-metrics`, and the `Service`'s name to
+`prometheus`. Change nothing else — the Deployment, ServiceAccount,
+ClusterRole and PVC keep their names. Lens then needs only the first two
+settings above, with **PROMETHEUS** left on `Auto Detect Prometheus` and
+the address field empty.
+
+> [!WARNING]
+> Do not do this with the **Lens Metrics** toggles on. Enabling the bundled
+> Prometheus deploys its own Service named `prometheus` into that
+> namespace, and the two installs then fight over one name. Keeping the
+> default `kubeloupe` namespace is what makes that collision impossible
+> rather than merely discouraged.
+
 ## Verify
 
 ```sh
