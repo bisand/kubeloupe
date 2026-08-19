@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: kubeloupe
+  name: lens-metrics
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: kubeloupe
-  namespace: kubeloupe
+  namespace: lens-metrics
 ---
 # Read-only, and narrow: Node and Pod objects supply capacity, requests
 # and limits, and nodes/proxy reaches each kubelet's /stats/summary
@@ -36,7 +36,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: kubeloupe
-    namespace: kubeloupe
+    namespace: lens-metrics
 ---
 # 64Mi against a snapshot of ~6 MB at the default 24h retention. No
 # storageClassName, so it takes the cluster default (local-path on k3s).
@@ -44,7 +44,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: kubeloupe
-  namespace: kubeloupe
+  namespace: lens-metrics
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:
@@ -55,7 +55,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kubeloupe
-  namespace: kubeloupe
+  namespace: lens-metrics
   labels:
     app.kubernetes.io/name: kubeloupe
 spec:
@@ -90,7 +90,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kubeloupe
-          image: ghcr.io/bisand/kubeloupe:0.2.6
+          image: ghcr.io/bisand/kubeloupe:0.2.7
           # IfNotPresent rather than Always: the node already holds this
           # tag, so a restart never depends on the registry being
           # reachable -- but a rebuilt node can still pull it.
@@ -150,18 +150,19 @@ spec:
           persistentVolumeClaim:
             claimName: kubeloupe
 ---
-# Lens' own provider is `isConfigurable: false` and only ever looks for a
-# Service named `prometheus` in namespace `lens-metrics`, so it cannot be
-# pointed here. The Helm provider can: it takes an explicit address, and
-# its grammar differs from Lens' in eight of forty queries, every one a
-# label rename that the node series now carry both sides of. Set
-# PROMETHEUS to `Helm` and PROMETHEUS SERVICE ADDRESS to
-# `kubeloupe/kubeloupe:80`.
+# The name and namespace are chosen so Lens needs no configuration: its
+# built-in provider does a literal lookup of the Service `prometheus` in
+# namespace `lens-metrics` and is declared `isConfigurable: false`, so this
+# is the one path in that requires no address typed anywhere. That is also
+# why Lens' bundled metrics must stay off -- enabling them puts a second
+# Service by this name in this namespace. Rename both to `kubeloupe` if you
+# would rather have your own namespace; the daemon does not care, but Lens
+# then needs PROMETHEUS set to `Helm` and an explicit service address.
 apiVersion: v1
 kind: Service
 metadata:
-  name: kubeloupe
-  namespace: kubeloupe
+  name: prometheus
+  namespace: lens-metrics
   labels:
     app.kubernetes.io/name: kubeloupe
 spec:
