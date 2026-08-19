@@ -327,6 +327,27 @@ invisible in a chart: an unanchored pod regex silently summing `api-1`
 with `api-10`, a container restart reading as a negative rate, and a
 stale series flatlining instead of breaking the line.
 
+## The name
+
+A **loupe** is the small lens a jeweller or watchmaker holds up to one eye
+to look closely at one thing. No bench, no stand, no apparatus — you carry
+it in a pocket and hold it up when you need it. That is the whole design
+brief: 2 MB and ~10 MiB of resident memory against a 170 MB stack, for
+someone looking closely at one small cluster.
+
+`kubeloupe` rather than plain `loupe` because that word is thoroughly
+taken — a commercial APM product trades as Loupe, crates.io's belongs to
+Wasmer, and npm's is a dependency of Chai. Four extra characters is a
+cheap price for not being the fifth thing with the name.
+
+No hyphen, which is not an aesthetic choice: Kubernetes reserves the
+`kube-` prefix for its own namespaces, so `kube-loupe` would be squatting
+on a reservation. `kubeloupe` isn't.
+
+It does still install into a namespace called `lens-metrics`, which is the
+one name here that nobody chose — see [Quick start](#quick-start). A loupe
+is only useful held up to something, and Lens decides where it gets held.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
