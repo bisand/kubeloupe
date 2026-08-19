@@ -62,11 +62,16 @@ before a `rate()` has anything to draw.
 In **Cluster Settings → Metrics**, two settings will otherwise make a
 working daemon look broken. Both fail *silently*:
 
-1. **Set METRICS SOURCE to Prometheus.** Left on `Automatic`, Lens
-   Desktop may resolve to "Kubernetes Metrics Server" and report
-   *"Metrics are not available due to missing or invalid configuration"* —
-   even with this daemon running and answering correctly. It does not fall
-   through to a Prometheus-compatible service on its own.
+1. **Check METRICS SOURCE.** `Automatic` often resolves to Prometheus by
+   itself once the Service exists: the Metrics page then reads *Currently
+   used metrics source: Prometheus*, with `Provider: Lens` and the detected
+   path under AUTO DETECTED PROMETHEUS DETAILS. When it does, there is
+   nothing to change. But it can settle on "Kubernetes Metrics Server"
+   instead and report *"Metrics are not available due to missing or invalid
+   configuration"* while this daemon is running and answering correctly —
+   most likely when the cluster was already open in Lens before the daemon
+   was installed. Setting the source to `Prometheus` explicitly is the
+   reliable fix, and costs nothing when detection would have worked.
 2. **Make sure HIDE METRICS FROM THE UI is empty.** If resource types are
    listed there, the cluster overview renders only the issues panel — no
    time-range dropdown, no donuts, no charts, and no error explaining why.
