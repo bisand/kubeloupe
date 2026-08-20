@@ -8,6 +8,7 @@
 //! answers the subset of PromQL Lens actually generates.
 
 mod api;
+mod chunk;
 mod collect;
 mod discovery;
 mod kube;

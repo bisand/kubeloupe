@@ -84,10 +84,9 @@ fn parse_args(raw: &str) -> Result<Args, String> {
 /// was drained yesterday keeps appearing in Grafana's variable dropdown
 /// for as long as retention holds it.
 fn matching<'a>(store: &'a Store, args: &Args) -> Vec<&'a Series> {
-    let in_window = |series: &Series| match (series.samples.first(), series.samples.last()) {
+    let in_window = |series: &Series| match (series.first_t(), series.last_t()) {
         (Some(first), Some(last)) => {
-            args.start.is_none_or(|start| last.t >= start)
-                && args.end.is_none_or(|end| first.t <= end)
+            args.start.is_none_or(|start| last >= start) && args.end.is_none_or(|end| first <= end)
         }
         _ => false,
     };

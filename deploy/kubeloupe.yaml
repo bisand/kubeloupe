@@ -38,8 +38,11 @@ subjects:
     name: kubeloupe
     namespace: lens-metrics
 ---
-# 64Mi against a snapshot of ~6 MB at the default 24h retention. No
-# storageClassName, so it takes the cluster default (local-path on k3s).
+# 64Mi against a snapshot of roughly 1 MB at the default 24h retention --
+# the file holds the store's compressed chunks verbatim. Sized well clear
+# of that because save() writes a temporary file beside the live one and
+# renames, so the peak is both together. No storageClassName, so it takes
+# the cluster default (local-path on k3s).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -135,9 +138,11 @@ spec:
             requests:
               cpu: 20m
               memory: 48Mi
-            # Sized for the store: ~400 series x 2880 samples x 16 bytes
-            # is about 18 MB, plus the runtime. Raise this before raising
-            # RETENTION_HOURS.
+            # Sized for the store: ~400 series x 2880 samples x ~1.9 bytes
+            # is about 2 MB, plus the runtime. Deliberately left with room
+            # to spare -- the request has not been lowered to match until
+            # the compressed build has a day of real measurement behind
+            # it. Raise the limit before raising RETENTION_HOURS.
             limits:
               memory: 128Mi
           securityContext:

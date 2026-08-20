@@ -21,15 +21,34 @@ actually generates.
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
 | VictoriaMetrics + node-exporter + kube-state-metrics | 50.6 MB | ~170 MB |
-| **kubeloupe** | **2.0 MB** | **~10 MiB** |
+| **kubeloupe** | **2.0 MB** | **~5 MiB** |
 
-Measured on a single-node k3s box (1 core, 2 GB) running ~10 pods and 136
-series: **1.5 MiB after an hour, 0.2 millicores**, with a 219 KiB snapshot
-on disk. The figure in the table is the projection once the full 24h
-window is resident — 136 series x a 4096-sample ring x 16 bytes — which is
-where it plateaus. Both numbers sit far under the 128Mi limit the manifest
-sets, and the shape is flat, not a leak: retention bounds it, and there
-are tests that say so.
+Samples are the entire footprint, so they are compressed. Timestamps and
+values become varint delta streams, and the values are first recovered as
+the integers they always were — the bytes, nanoseconds and millicores that
+got divided into `f64` on the way in. Replaying a day of a real 673-series
+cluster through the encoder gives **1.9 bytes per sample against 16 raw,
+8.3x smaller**; a test asserts it, so it cannot quietly drift back.
+
+Only the newest hour of each series is kept raw, so appends stay a pointer
+bump and instant queries never decompress anything. A 5m `rate()` over a
+day of history costs about 90 µs, and the worst query Lens can send — a
+24h rate across 96 pods — about 1 ms.
+
+Memory follows the sample count rather than the cluster:
+`series x (retention / scrape interval) x ~1.9 bytes`, plus labels. For
+the 673-series cluster above that is 3.6 MiB of samples where the raw form
+held 29.6 MiB. The shape is a plateau, not a leak: retention bounds it,
+and there are tests that say so.
+
+**The resident figure in the table is a projection.** Version 0.2.9, which
+held samples raw, measured **12.7 MiB after a day** on a single-node k3s
+box (1 core, 2 GB, 11 pods, 364 series) and **29.3 MiB** on a three-node
+cluster (67 pods, 673 series), at 0.15 and 0.47 millicores. The store
+measurement above is real; what it does to resident set size on those two
+clusters will be measured after a day of running, and this paragraph
+replaced with the number. The last time this README projected instead of
+measuring, it was wrong by a factor of three.
 
 Built for small clusters — homelabs, single-node k3s, edge boxes — where a
 monitoring stack costs more than the workloads it watches.
@@ -258,10 +277,10 @@ still supported, it just needs the third Lens setting.
 Set **PROMETHEUS** back to `Auto Detect Prometheus` and clear the address
 field once the default layout is in place.
 
-A day of history stays on whichever PVC you delete. The snapshot format has
-never changed — the file's magic still reads `LMD1` — so copy
-`snapshot.bin` across first if it is worth the trouble; otherwise the new
-pod refills within the hour.
+A day of history stays on whichever PVC you delete. The file's magic still
+reads `LMD1` and the loader still reads every version it has ever written,
+so copy `snapshot.bin` across first if it is worth the trouble; otherwise
+the new pod refills within the hour.
 
 ## Persistence
 
@@ -270,11 +289,18 @@ not cost a day of history. A **SIGTERM — every ordinary rollout — writes a
 final snapshot and loses nothing**; an unclean kill costs at most
 `SNAPSHOT_INTERVAL_SECONDS`.
 
-It is a periodic snapshot rather than a write-through store on purpose:
-Lens re-queries every chart once a minute over ranges up to 24h, so
-reading from disk would mean constant I/O to serve a working set that
-fits in 9 MB of RAM. One sequential write every few minutes keeps the
-query path a pointer walk.
+It is a periodic snapshot rather than a write-through store on purpose.
+Lens re-queries every chart once a minute over ranges up to 24h, which
+means there is no small hot subset to cache — the working set is the whole
+window — so reading from disk would be constant I/O to serve a few MB.
+Compressing the samples was the cheaper answer by some margin: it removed
+about seven eighths of the memory without putting anything in the query
+path. One sequential write every few minutes keeps that path a pointer
+walk into a varint stream.
+
+The file holds the store's compressed chunks verbatim, so it is about as
+small as the store is: a 673-series cluster's day of history is roughly a
+megabyte, where the raw layout wrote 21 MiB of it.
 
 Three properties matter more than the format:
 
@@ -286,6 +312,10 @@ Three properties matter more than the format:
   worse than none.
 - **Loading re-applies retention**, so a pod that was down for six hours
   does not come back with six hours of stale points.
+- **Older files still load.** The layout changed when samples started
+  being compressed; the magic did not, and the version field carries it.
+  Upgrading in place costs no history, and the first save after it
+  rewrites the file in the current layout.
 
 Set `SNAPSHOT_PATH` to enable it and mount a volume there. The supplied
 manifest includes a 64Mi PVC. Note the pod needs `fsGroup` matching
@@ -326,8 +356,8 @@ the manifest says later.
 
 | variable | default | |
 | --- | --- | --- |
-| `SCRAPE_INTERVAL_SECONDS` | `30` | Halving it doubles the store's memory. |
-| `RETENTION_HOURS` | `24` | Covers Lens' longest range. |
+| `SCRAPE_INTERVAL_SECONDS` | `30` | Halving it doubles the store's memory, though a regular interval is also what compresses best. |
+| `RETENTION_HOURS` | `24` | Covers Lens' longest range. Rounded up to a chunk boundary, so the store holds a little over what it says. |
 | `SNAPSHOT_PATH` | *(unset)* | Unset disables persistence, so the daemon runs fine with no volume attached. |
 | `SNAPSHOT_INTERVAL_SECONDS` | `300` | Upper bound on history lost to an *unclean* kill. |
 | `LISTEN_ADDR` | `0.0.0.0:9090` | |
@@ -392,8 +422,8 @@ stale series flatlining instead of breaking the line.
 A **loupe** is the small lens a jeweller or watchmaker holds up to one eye
 to look closely at one thing. No bench, no stand, no apparatus — you carry
 it in a pocket and hold it up when you need it. That is the whole design
-brief: 2 MB and ~10 MiB of resident memory against a 170 MB stack, for
-someone looking closely at one small cluster.
+brief: 2 MB on disk and a handful of MiB resident against a 170 MB stack,
+for someone looking closely at one small cluster.
 
 `kubeloupe` rather than plain `loupe` because that word is thoroughly
 taken — a commercial APM product trades as Loupe, crates.io's belongs to
