@@ -41,14 +41,16 @@ the 673-series cluster above that is 3.6 MiB of samples where the raw form
 held 29.6 MiB. The shape is a plateau, not a leak: retention bounds it,
 and there are tests that say so.
 
-**The resident figure in the table is a projection.** Version 0.2.9, which
-held samples raw, measured **12.7 MiB after a day** on a single-node k3s
-box (1 core, 2 GB, 11 pods, 364 series) and **29.3 MiB** on a three-node
-cluster (67 pods, 673 series), at 0.15 and 0.47 millicores. The store
-measurement above is real; what it does to resident set size on those two
-clusters will be measured after a day of running, and this paragraph
-replaced with the number. The last time this README projected instead of
-measuring, it was wrong by a factor of three.
+**The resident figure in the table is not settled yet.** The raw-sample
+build — image `0.2.8`, whose daemon `0.2.9` did not change — measured
+**13.3 MiB after a day** on a single-node k3s box (1 core, 2 GB, 11 pods,
+370 series) and **29.3 MiB** on a three-node cluster (67 pods, 673
+series), at 0.15 and 0.47 millicores. Rolled onto the same k3s box with
+its day of history restored from the snapshot, this version came back at
+**2.4 MiB** holding the same 346k samples. That reading is minutes old
+rather than a day old, so the table rounds up and this paragraph will be
+replaced once it has run a full day. The last time this README projected
+instead of measuring, it was wrong by a factor of three.
 
 Built for small clusters — homelabs, single-node k3s, edge boxes — where a
 monitoring stack costs more than the workloads it watches.
