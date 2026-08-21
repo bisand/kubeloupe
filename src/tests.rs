@@ -1014,18 +1014,42 @@ fn compression_holds_the_footprint_the_readme_claims() {
         }
     }
 
+    // Two different things are worth guarding, and conflating them is how
+    // the README came to claim a figure this test does not check.
+    //
+    //   encoder -- bytes of sealed chunk payload per sample it holds
+    //   store   -- the whole cost, payload plus the raw head and the slack
+    //              in the vectors that hold both
+    //
+    // On a real cluster's day those measure 1.28 and 2.44 bytes. They are
+    // not reproduced here: this fixture is synthetic and more regular than
+    // real data, so it compresses better. The thresholds below are
+    // regression guards against drifting back toward raw, not a restatement
+    // of the measurement.
     let samples = store.sample_count();
-    let bytes = store.heap_size();
-    let per_sample = bytes as f64 / samples as f64;
+    let store_bytes = store.heap_size();
+    let store_rate = store_bytes as f64 / samples as f64;
+
+    let mut payload = 0usize;
+    let mut in_chunks = 0usize;
+    for series in store.series_iter() {
+        for chunk in series.sealed_chunks() {
+            payload += chunk.heap_size();
+            in_chunks += chunk.len();
+        }
+    }
+    let encoder_rate = payload as f64 / in_chunks as f64;
 
     assert_eq!(store.series_count(), pods as usize * 4);
-    // Raw would be 16 bytes a sample. The measurement on the real cluster
-    // came out at 1.3; leave headroom for the head chunk, which is always
-    // uncompressed, but fail if this ever drifts back toward raw.
     assert!(
-        per_sample < 2.0,
-        "{per_sample:.2} bytes/sample over {samples} samples ({bytes} bytes) \
-         -- compression has regressed"
+        encoder_rate < 1.5,
+        "{encoder_rate:.2} bytes/sample of chunk payload over {in_chunks} samples \
+         -- the encoder has regressed"
+    );
+    assert!(
+        store_rate < 2.0,
+        "{store_rate:.2} bytes/sample over {samples} samples ({store_bytes} bytes) \
+         -- the store has regressed"
     );
 }
 

@@ -21,14 +21,17 @@ actually generates.
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
 | VictoriaMetrics + node-exporter + kube-state-metrics | 50.6 MB | ~170 MB |
-| **kubeloupe** | **2.0 MB** | **~5 MiB** |
+| **kubeloupe** | **2.0 MB** | **2.6-12 MiB** |
 
 Samples are the entire footprint, so they are compressed. Timestamps and
 values become varint delta streams, and the values are first recovered as
 the integers they always were — the bytes, nanoseconds and millicores that
 got divided into `f64` on the way in. Replaying a day of a real 673-series
-cluster through the encoder gives **1.9 bytes per sample against 16 raw,
-8.3x smaller**; a test asserts it, so it cannot quietly drift back.
+cluster through the encoder gives **1.28 bytes per sample against 16 raw,
+12x smaller**. The store costs more than the encoder does — 2.44 bytes a
+sample on that same day — because the newest hour of each series is held
+raw and the vectors holding both carry some slack. Tests guard each figure
+separately, so neither can quietly drift back toward raw.
 
 Only the newest hour of each series is kept raw, so appends stay a pointer
 bump and instant queries never decompress anything. A 5m `rate()` over a
@@ -36,21 +39,35 @@ day of history costs about 90 µs, and the worst query Lens can send — a
 24h rate across 96 pods — about 1 ms.
 
 Memory follows the sample count rather than the cluster:
-`series x (retention / scrape interval) x ~1.9 bytes`, plus labels. For
-the 673-series cluster above that is 3.6 MiB of samples where the raw form
-held 29.6 MiB. The shape is a plateau, not a leak: retention bounds it,
+`series x (retention / scrape interval) x ~2.4 bytes`, plus labels — the
+store figure rather than the encoder's, since that is what is resident.
+For the 673-series cluster above that is 4.5 MiB of samples where the raw
+form held 29.6 MiB. The shape is a plateau, not a leak: retention bounds it,
 and there are tests that say so.
 
-**The resident figure in the table is not settled yet.** The raw-sample
-build — image `0.2.8`, whose daemon `0.2.9` did not change — measured
-**13.3 MiB after a day** on a single-node k3s box (1 core, 2 GB, 11 pods,
-370 series) and **29.3 MiB** on a three-node cluster (67 pods, 673
-series), at 0.15 and 0.47 millicores. Rolled onto the same k3s box with
-its day of history restored from the snapshot, this version came back at
-**2.4 MiB** holding the same 346k samples. That reading is minutes old
-rather than a day old, so the table rounds up and this paragraph will be
-replaced once it has run a full day. The last time this README projected
-instead of measuring, it was wrong by a factor of three.
+Four clusters have now run this version for a full day. The raw-sample
+build — image `0.2.8`, whose daemon `0.2.9` did not change — was measured
+on the same four in the hour before the upgrade, holding sample counts
+within 3% of the ones below, so the columns compare like with like.
+
+| cluster | series | samples | before | after |
+| --- | ---: | ---: | ---: | ---: |
+| 1 node, 10 pods | 122 | 354k | 13.25 MiB | **2.63 MiB** |
+| 1 node, 21 pods | 194 | 537k | 14.84 MiB | **3.07 MiB** |
+| 3 nodes, 65 pods | 538 | 1.53M | 32.71 MiB | **5.79 MiB** |
+| 5 nodes, 107 pods | 1247 | 2.63M | 61.77 MiB | **12.00 MiB** |
+
+That is 4.8x to 5.6x less resident memory for the same history. CPU did
+not move to pay for it: 0.15 to 0.41 millicores across the first three,
+against 0.15 to 0.49 before. The five-node box is not comparable on CPU —
+its old figure was inflated by a snapshot that failed on a full volume
+every five minutes, which the compressed file fixed.
+
+Figures are container working set after 23 to 24 hours of uptime; RSS runs
+0.2 to 0.7 MiB below each. Across the whole process that is 4.0 to 7.8
+bytes a sample — the store's 1.3, plus labels, the series index and
+allocator slack, spread over fewer samples on the smaller clusters. The
+five-node box came down from 25.1 bytes a sample to 4.8.
 
 Built for small clusters — homelabs, single-node k3s, edge boxes — where a
 monitoring stack costs more than the workloads it watches.
@@ -301,8 +318,8 @@ path. One sequential write every few minutes keeps that path a pointer
 walk into a varint stream.
 
 The file holds the store's compressed chunks verbatim, so it is about as
-small as the store is: a 673-series cluster's day of history is roughly a
-megabyte, where the raw layout wrote 21 MiB of it.
+small as the store is: a 673-series cluster's day of history is roughly
+two and a half megabytes, where the raw layout wrote 21 MiB of it.
 
 Three properties matter more than the format:
 
