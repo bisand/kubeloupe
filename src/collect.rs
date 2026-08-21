@@ -13,7 +13,7 @@
 //! chart is supposed to show -- without this daemon ever reading
 //! /proc/meminfo or needing a hostPath mount to do it.
 
-use crate::kube::{Client, parse_quantity};
+use crate::kube::{Client, List, Pod, parse_quantity};
 use crate::store::{Store, labels};
 use std::collections::HashMap;
 
@@ -21,9 +21,97 @@ use std::collections::HashMap;
 /// so a container whose image we cannot resolve must still carry one.
 const UNKNOWN_IMAGE: &str = "unknown";
 
-pub async fn collect(client: &Client, store: &mut Store, now: i64) -> anyhow::Result<()> {
+/// The pod list, held between scrapes.
+///
+/// It is the largest thing this daemon reads -- on a 107-pod cluster it is
+/// 0.9 MB of JSON against 0.5 MB for every kubelet summary put together --
+/// and almost none of it changes between scrapes. Container images and
+/// resource requests are fixed for the life of a pod; only the set of pods
+/// moves, and it moves on the timescale of a rollout, not a scrape.
+///
+/// So it is refetched on its own slower cadence and the series derived
+/// from it are still appended every scrape, from the held copy.
+///
+/// Left at that, the interval would widen a real hazard. A container the
+/// list has not seen gets `image="unknown"`, and when the real image
+/// arrives it starts a *different* series -- so for one `LOOKBACK` both
+/// answer, and `sum(...) by (pod)` counts the pod twice. A 30s window for
+/// that is a sample; a 5m window is ten. So a scrape that meets a
+/// container it cannot name marks the list stale and the next one
+/// refetches, which bounds the window to one scrape either way and leaves
+/// the interval to govern only the case where nothing changed.
+///
+/// What the interval does still cost: a pod deleted just after a refresh
+/// keeps receiving `kube_pod_container_resource_*` samples until the next
+/// one. Those are the requests and limits it was configured with, they do
+/// not move, and retention drops them like any other stale series.
+pub struct PodCache {
+    pods: List<Pod>,
+    fetched_at: i64,
+    /// Set when a scrape saw a container this list cannot name, so the
+    /// next one refetches regardless of the interval.
+    stale: bool,
+}
+
+impl PodCache {
+    #[cfg(test)]
+    pub fn for_test(fetched_at: i64) -> Option<Self> {
+        Some(Self {
+            pods: List { items: Vec::new() },
+            fetched_at,
+            stale: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn mark_stale_for_test(&mut self) {
+        self.stale = true;
+    }
+
+    pub(crate) fn needs_refresh(cache: &Option<Self>, now: i64, every: i64) -> bool {
+        match cache {
+            None => true,
+            Some(held) => held.stale || now - held.fetched_at >= every,
+        }
+    }
+}
+
+pub async fn collect(
+    client: &Client,
+    store: &mut Store,
+    now: i64,
+    cache: &mut Option<PodCache>,
+    refresh_every: i64,
+) -> anyhow::Result<()> {
     let nodes = client.nodes().await?;
-    let pods = client.pods().await?;
+
+    if PodCache::needs_refresh(cache, now, refresh_every) {
+        // A refresh that fails is not fatal while a previous list is held:
+        // the series it feeds are better a few minutes stale than absent,
+        // and the next scrape tries again. With nothing held there is
+        // nothing to fall back on, so the error propagates as before.
+        match client.pods().await {
+            Ok(pods) => {
+                *cache = Some(PodCache {
+                    pods,
+                    fetched_at: now,
+                    stale: false,
+                });
+            }
+            Err(error) => match cache {
+                Some(held) => eprintln!(
+                    "kubeloupe: refreshing the pod list failed, reusing the one from {}s ago: {error:#}",
+                    now - held.fetched_at
+                ),
+                None => return Err(error),
+            },
+        }
+    }
+
+    let pods = &cache
+        .as_ref()
+        .expect("a pod list is held once the first fetch has succeeded")
+        .pods;
 
     // (namespace, pod, container) -> image, so container series can carry
     // the label cadvisor would have provided.
@@ -86,6 +174,12 @@ pub async fn collect(client: &Client, store: &mut Store, now: i64) -> anyhow::Re
         }
     }
 
+    // A container the kubelet reports that the held pod list has never
+    // seen means the list is stale in the way that matters. Counting them
+    // is what keeps the refresh interval from widening the window in which
+    // a new pod's series carry `image="unknown"` -- see [`PodCache`].
+    let mut unnamed = 0usize;
+
     for node in &nodes.items {
         let name = &node.metadata.name;
 
@@ -117,7 +211,7 @@ pub async fn collect(client: &Client, store: &mut Store, now: i64) -> anyhow::Re
         // returned.
         match client.node_stats(name).await {
             Ok(stats) => {
-                collect_node_stats(store, name, &stats, &images, now);
+                unnamed += collect_node_stats(store, name, &stats, &images, now);
                 store.append(
                     labels("up", &[("instance", name), ("job", "kubeloupe")]),
                     now,
@@ -135,16 +229,24 @@ pub async fn collect(client: &Client, store: &mut Store, now: i64) -> anyhow::Re
         }
     }
 
+    if unnamed > 0
+        && let Some(held) = cache.as_mut()
+    {
+        held.stale = true;
+    }
+
     Ok(())
 }
 
+/// Returns how many containers the kubelet reported that the held pod list
+/// does not know an image for -- see [`PodCache`].
 fn collect_node_stats(
     store: &mut Store,
     node: &str,
     stats: &crate::kube::StatsSummary,
     images: &HashMap<(String, String, String), String>,
     now: i64,
-) {
+) -> usize {
     // Three names for one node, because the query grammar decides which
     // one is read. Lens filters kubelet and cadvisor series on `instance`
     // and groups node series by `kubernetes_node`; the Helm grammar uses
@@ -231,16 +333,20 @@ fn collect_node_stats(
         stats.pods.len() as f64,
     );
 
+    let mut unnamed = 0usize;
     for pod in &stats.pods {
         let ns = &pod.pod_ref.namespace;
         let name = &pod.pod_ref.name;
 
         for container in &pod.containers {
-            let image = images
+            let known = images
                 .get(&(ns.clone(), name.clone(), container.name.clone()))
                 .map(String::as_str)
-                .filter(|image| !image.is_empty())
-                .unwrap_or(UNKNOWN_IMAGE);
+                .filter(|image| !image.is_empty());
+            if known.is_none() {
+                unnamed += 1;
+            }
+            let image = known.unwrap_or(UNKNOWN_IMAGE);
 
             let container_labels: [(&str, &str); 5] = [
                 ("namespace", ns),
@@ -327,6 +433,8 @@ fn collect_node_stats(
             }
         }
     }
+
+    unnamed
 }
 
 fn unit_for(resource: &str) -> &'static str {

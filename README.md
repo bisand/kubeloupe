@@ -28,10 +28,10 @@ values become varint delta streams, and the values are first recovered as
 the integers they always were — the bytes, nanoseconds and millicores that
 got divided into `f64` on the way in. Replaying a day of a real 673-series
 cluster through the encoder gives **1.28 bytes per sample against 16 raw,
-12x smaller**. The store costs more than the encoder does — 2.44 bytes a
+12x smaller**. The store costs more than the encoder does — 2.28 bytes a
 sample on that same day — because the newest hour of each series is held
-raw and the vectors holding both carry some slack. Tests guard each figure
-separately, so neither can quietly drift back toward raw.
+raw. Tests guard each figure separately, so neither can quietly drift back
+toward raw.
 
 Only the newest hour of each series is kept raw, so appends stay a pointer
 bump and instant queries never decompress anything. A 5m `rate()` over a
@@ -39,9 +39,9 @@ day of history costs about 90 µs, and the worst query Lens can send — a
 24h rate across 96 pods — about 1 ms.
 
 Memory follows the sample count rather than the cluster:
-`series x (retention / scrape interval) x ~2.4 bytes`, plus labels — the
+`series x (retention / scrape interval) x ~2.3 bytes`, plus labels — the
 store figure rather than the encoder's, since that is what is resident.
-For the 673-series cluster above that is 4.5 MiB of samples where the raw
+For the 673-series cluster above that is 4.2 MiB of samples where the raw
 form held 29.6 MiB. The shape is a plateau, not a leak: retention bounds it,
 and there are tests that say so.
 
@@ -379,6 +379,7 @@ the manifest says later.
 | `RETENTION_HOURS` | `24` | Covers Lens' longest range. Rounded up to a chunk boundary, so the store holds a little over what it says. |
 | `SNAPSHOT_PATH` | *(unset)* | Unset disables persistence, so the daemon runs fine with no volume attached. |
 | `SNAPSHOT_INTERVAL_SECONDS` | `300` | Upper bound on history lost to an *unclean* kill. |
+| `POD_REFRESH_INTERVAL_SECONDS` | `300` | The pod list is the largest read and the slowest-changing, so it has its own cadence. A container it cannot name shortens the wait to one scrape. |
 | `LISTEN_ADDR` | `0.0.0.0:9090` | |
 
 RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy`.

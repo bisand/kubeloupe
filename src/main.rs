@@ -51,6 +51,10 @@ struct Config {
     snapshot_path: Option<PathBuf>,
     /// The upper bound on how much history an unclean kill can cost.
     snapshot_interval: i64,
+    /// How often the pod list is refetched. It is the largest read this
+    /// daemon makes and the slowest-changing, so it does not belong on the
+    /// scrape interval.
+    pod_refresh_interval: i64,
 }
 
 impl Config {
@@ -64,6 +68,7 @@ impl Config {
                 .filter(|path| !path.trim().is_empty())
                 .map(PathBuf::from),
             snapshot_interval: env_or::<i64>("SNAPSHOT_INTERVAL_SECONDS", 300).max(1),
+            pod_refresh_interval: env_or::<i64>("POD_REFRESH_INTERVAL_SECONDS", 300).max(1),
         }
     }
 }
@@ -82,15 +87,17 @@ async fn main() -> Result<()> {
         config.scrape_interval,
         config.snapshot_path.clone(),
         config.snapshot_interval,
+        config.pod_refresh_interval,
     ));
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     eprintln!(
-        "kubeloupe: listening on {}, scraping every {}s, keeping {}h, snapshot {}",
+        "kubeloupe: listening on {}, scraping every {}s, pods every {}s, keeping {}h, snapshot {}",
         config.listen,
         config.scrape_interval,
+        config.pod_refresh_interval,
         config.retention / 3600,
         match &config.snapshot_path {
             Some(path) => format!("every {}s to {}", config.snapshot_interval, path.display()),
@@ -161,10 +168,12 @@ async fn collector_loop(
     scrape_interval: u64,
     snapshot_path: Option<PathBuf>,
     snapshot_interval: i64,
+    pod_refresh_interval: i64,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(scrape_interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_snapshot = now();
+    let mut pods = None;
 
     loop {
         ticker.tick().await;
@@ -176,7 +185,15 @@ async fn collector_loop(
             // stores to swap between would cost twice the memory to avoid
             // a wait Lens never notices.
             let mut guard = store.write().await;
-            if let Err(error) = collect::collect(&client, &mut guard, started).await {
+            if let Err(error) = collect::collect(
+                &client,
+                &mut guard,
+                started,
+                &mut pods,
+                pod_refresh_interval,
+            )
+            .await
+            {
                 eprintln!("kubeloupe: collection failed: {error:#}");
             }
             // Outside the error path on purpose. Pruning used to be the

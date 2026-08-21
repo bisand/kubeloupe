@@ -199,10 +199,26 @@ impl Series {
         if self.head.is_empty() {
             return;
         }
+        let filled = self.head.len();
+
+        // `push` alone would double the capacity. A series holds a
+        // predictable number of chunks -- retention divided by a chunk's
+        // span -- so the spare half is pure waste at 40 bytes a slot, and
+        // growing by exactly one costs one realloc an hour.
+        self.chunks.reserve_exact(1);
         self.chunks.push(chunk::encode(&self.head));
-        // `clear` keeps the allocation, which is exactly what we want:
-        // the next window reuses it instead of growing from nothing.
+
+        // `clear` keeps the allocation, which is what we want: the next
+        // window reuses it instead of growing from nothing. But the head
+        // doubled its way up to the seal point and so holds the next power
+        // of two -- 128 slots for 120 samples. Trim it to what the window
+        // actually reached. Done here rather than up front because a
+        // churning pod reports a handful of times and never seals at all.
         self.head.clear();
+        if self.head.capacity() > filled {
+            self.head.shrink_to_fit();
+            self.head.reserve_exact(filled);
+        }
     }
 
     /// Drops everything older than `cutoff`. Sealed chunks go whole -- see

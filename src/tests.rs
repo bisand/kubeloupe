@@ -1314,3 +1314,40 @@ fn a_mutated_chunk_is_rejected_rather_than_trusted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- the pod list cache ---------------------------------------------------
+
+#[test]
+fn the_pod_list_is_refetched_on_its_own_interval() {
+    use crate::collect::PodCache;
+
+    // Nothing held: the first scrape must fetch.
+    assert!(PodCache::needs_refresh(&None, 1_000, 300));
+
+    let held = PodCache::for_test(1_000);
+    // Inside the interval, the held list is reused.
+    assert!(!PodCache::needs_refresh(&held, 1_000, 300));
+    assert!(!PodCache::needs_refresh(&held, 1_299, 300));
+    // On it, and past it, it is refetched.
+    assert!(PodCache::needs_refresh(&held, 1_300, 300));
+    assert!(PodCache::needs_refresh(&held, 9_999, 300));
+}
+
+#[test]
+fn a_container_the_pod_list_cannot_name_forces_a_refetch() {
+    use crate::collect::PodCache;
+
+    // The hazard this guards: an unnamed container gets image="unknown",
+    // and when the real image arrives it starts a second series. Both
+    // answer for one lookback, and a sum by (pod) counts the pod twice.
+    // Waiting out the interval would make that window ten samples instead
+    // of one, so seeing one must shorten the wait to a single scrape.
+    let mut held = PodCache::for_test(1_000);
+    assert!(!PodCache::needs_refresh(&held, 1_030, 300));
+
+    held.as_mut().unwrap().mark_stale_for_test();
+    assert!(
+        PodCache::needs_refresh(&held, 1_030, 300),
+        "a list that cannot name a running container must not be reused"
+    );
+}
