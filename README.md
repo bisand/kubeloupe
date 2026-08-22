@@ -21,7 +21,7 @@ actually generates.
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
 | VictoriaMetrics + node-exporter + kube-state-metrics | 50.6 MB | ~170 MB |
-| **kubeloupe** | **2.0 MB** | **2.6-12 MiB** |
+| **kubeloupe** | **2.0 MB** | **3.6-9.9 MiB** |
 
 Samples are the entire footprint, so they are compressed. Timestamps and
 values become varint delta streams, and the values are first recovered as
@@ -38,36 +38,75 @@ bump and instant queries never decompress anything. A 5m `rate()` over a
 day of history costs about 90 µs, and the worst query Lens can send — a
 24h rate across 96 pods — about 1 ms.
 
-Memory follows the sample count rather than the cluster:
+Sample memory follows the sample count rather than the cluster:
 `series x (retention / scrape interval) x ~2.3 bytes`, plus labels — the
 store figure rather than the encoder's, since that is what is resident.
 For the 673-series cluster above that is 4.2 MiB of samples where the raw
 form held 29.6 MiB. The shape is a plateau, not a leak: retention bounds it,
 and there are tests that say so.
 
-Four clusters have now run this version for a full day. The raw-sample
-build — image `0.2.8`, whose daemon `0.2.9` did not change — was measured
-on the same four in the hour before the upgrade, holding sample counts
-within 3% of the ones below, so the columns compare like with like.
+Four clusters have now run this for a full day on each build. The raw-sample
+build — image `0.2.8`, whose daemon `0.2.9` did not change — was measured on
+the same four in the hour before the compression upgrade, holding sample
+counts within 3% of `0.2.10`'s, so those two columns compare like with like.
 
-| cluster | series | samples | before | after |
+| cluster | series | samples | `0.2.8` | `0.2.10` |
 | --- | ---: | ---: | ---: | ---: |
 | 1 node, 10 pods | 122 | 354k | 13.25 MiB | **2.63 MiB** |
 | 1 node, 21 pods | 194 | 537k | 14.84 MiB | **3.07 MiB** |
 | 3 nodes, 65 pods | 538 | 1.53M | 32.71 MiB | **5.79 MiB** |
 | 5 nodes, 107 pods | 1247 | 2.63M | 61.77 MiB | **12.00 MiB** |
 
-That is 4.8x to 5.6x less resident memory for the same history. CPU did
-not move to pay for it: 0.15 to 0.41 millicores across the first three,
-against 0.15 to 0.49 before. The five-node box is not comparable on CPU —
-its old figure was inflated by a snapshot that failed on a full volume
-every five minutes, which the compressed file fixed.
+That is 4.8x to 5.6x less resident memory for the same history.
 
-Figures are container working set after 23 to 24 hours of uptime; RSS runs
-0.2 to 0.7 MiB below each. Across the whole process that is 4.0 to 7.8
-bytes a sample — the store's 1.3, plus labels, the series index and
-allocator slack, spread over fewer samples on the smaller clusters. The
-five-node box came down from 25.1 bytes a sample to 4.8.
+`0.2.11` sizes the head and chunk vectors exactly and refetches the pod list
+every 5 minutes rather than every 30 seconds. The same four, after 24.7 hours
+on it:
+
+| cluster | series | samples | working set | RSS | bytes/sample |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 node, 10 pods | 122 | 351k | 3.56 MiB | **1.68 MiB** | 5.03 |
+| 1 node, 21 pods | 423 | 553k | 5.50 MiB | **2.91 MiB** | 5.53 |
+| 3 nodes, 65 pods | 530 | 1.58M | 5.66 MiB | **5.33 MiB** | 3.54 |
+| 5 nodes, 107 pods | 963 | 2.79M | 9.93 MiB | **9.46 MiB** | 3.56 |
+
+Series counts drift with what the clusters happen to be running, so bytes a
+sample is what compares across a day; absolute MiB does not. `0.2.10` at 28
+hours on the same four cost 7.07, 4.58, 4.62 and 4.67 bytes a sample. Three of
+the four came down 21 to 29% — sizing the vectors exactly is worth about a
+fifth of resident memory once a process has settled.
+
+The 32-37% drop that showed minutes after the rollout was too good. Those were
+fresh processes read against `0.2.10` figures carrying a day of allocator churn,
+and roughly a third of the apparent win was the freshness rather than the code.
+The matched-uptime figure above is the one to quote.
+
+The one-node, 21-pod row does not measure the change. Its series count went
+from 194 to 423 while its samples barely moved, so per-series cost spread over
+the same samples pushed its bytes a sample up rather than down. The extra
+series come from pod churn on that cluster which the daemon did not attribute
+to an image.
+
+CPU came down with the pod list, which is the largest read this makes. The
+107-pod cluster parses about 1.46 MiB of JSON a scrape, 0.89 MiB of it the pod
+list; at one refetch per ten scrapes its average went from 1.479 to 0.901
+millicores. The other three went 0.201 to 0.092, 0.149 to 0.097, and 0.437 to
+0.275.
+
+Working set and RSS have separated on the two clusters whose snapshot volume is
+a hostPath — 1.9 and 2.6 MiB apart, against 0.3 and 0.5 MiB on the two backed
+by Longhorn — and that gap grew over the day while RSS stayed flat, which is
+what page cache from the snapshot writes being charged to the container would
+look like. RSS is the like-for-like number across all four. The range in the
+table at the top is working set, which is the more pessimistic of the two.
+
+Across the whole process that is 3.5 to 5.5 bytes a sample — the store's 1.3,
+plus labels, the series index and allocator slack, spread over fewer samples on
+the smaller clusters. The five-node box has come down from 25.1 bytes a sample
+on `0.2.8`, to 4.8 on `0.2.10`, to 3.56. Underneath that, resident memory now
+tracks series count more than sample count: the two Longhorn-backed clusters
+both settled at about 10 KiB a series, and the 122-series box costs 14 KiB
+because fixed process cost has fewer series to spread across.
 
 Built for small clusters — homelabs, single-node k3s, edge boxes — where a
 monitoring stack costs more than the workloads it watches.
