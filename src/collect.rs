@@ -113,32 +113,21 @@ pub async fn collect(
         .expect("a pod list is held once the first fetch has succeeded")
         .pods;
 
-    // (namespace, pod, container) -> image, so container series can carry
-    // the label cadvisor would have provided.
-    let mut images: HashMap<(String, String, String), String> = HashMap::new();
+    let images = pod_images(pods);
 
     for pod in &pods.items {
         let ns = &pod.metadata.namespace;
         let name = &pod.metadata.name;
 
-        for container in &pod.spec.containers {
-            images.insert(
-                (ns.clone(), name.clone(), container.name.clone()),
-                container.image.clone(),
-            );
-        }
-        // The status image is the resolved one (digest, defaulted
-        // registry); prefer it where the kubelet has reported it.
-        for status in &pod.status.container_statuses {
-            if !status.image.is_empty() {
-                images.insert(
-                    (ns.clone(), name.clone(), status.name.clone()),
-                    status.image.clone(),
-                );
-            }
-        }
-
-        for container in &pod.spec.containers {
+        // Sidecars reserve for the pod's whole life, so their requests and
+        // limits belong in the pod's totals. Plain init containers have
+        // finished by the time anything is scraped and do not.
+        for container in pod
+            .spec
+            .containers
+            .iter()
+            .chain(pod.spec.init_containers.iter().filter(|c| c.is_sidecar()))
+        {
             for (metric, quantities) in [
                 (
                     "kube_pod_container_resource_requests",
@@ -236,6 +225,48 @@ pub async fn collect(
     }
 
     Ok(())
+}
+
+/// `(namespace, pod, container) -> image`, so container series can carry the
+/// label cadvisor would have provided.
+///
+/// Init containers are mapped as well as ordinary ones. A **sidecar** -- an
+/// init container with `restartPolicy: Always` -- runs for the pod's whole
+/// life and the kubelet reports it under `containers` in stats/summary, so
+/// reading only `spec.containers` leaves a running container this daemon
+/// cannot name. Plain init containers are carried too: they cost nothing and
+/// one can still be running when a scrape lands.
+pub fn pod_images(pods: &List<Pod>) -> HashMap<(String, String, String), String> {
+    let mut images: HashMap<(String, String, String), String> = HashMap::new();
+
+    for pod in &pods.items {
+        let ns = &pod.metadata.namespace;
+        let name = &pod.metadata.name;
+
+        for container in pod.spec.containers.iter().chain(&pod.spec.init_containers) {
+            images.insert(
+                (ns.clone(), name.clone(), container.name.clone()),
+                container.image.clone(),
+            );
+        }
+        // The status image is the resolved one (digest, defaulted
+        // registry); prefer it where the kubelet has reported it.
+        for status in pod
+            .status
+            .container_statuses
+            .iter()
+            .chain(&pod.status.init_container_statuses)
+        {
+            if !status.image.is_empty() {
+                images.insert(
+                    (ns.clone(), name.clone(), status.name.clone()),
+                    status.image.clone(),
+                );
+            }
+        }
+    }
+
+    images
 }
 
 /// Returns how many containers the kubelet reported that the held pod list

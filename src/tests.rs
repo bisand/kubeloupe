@@ -1351,3 +1351,91 @@ fn a_container_the_pod_list_cannot_name_forces_a_refetch() {
         "a list that cannot name a running container must not be reused"
     );
 }
+
+// --- sidecars -------------------------------------------------------------
+
+/// A CloudNativePG pod as the API server actually returns it: one ordinary
+/// container, one plain init container, and one sidecar -- an init container
+/// with `restartPolicy: Always`. The kubelet reports the sidecar under
+/// `containers` in stats/summary, so it has to be nameable from here.
+const POD_WITH_SIDECAR: &str = r#"{
+  "items": [{
+    "metadata": { "name": "pg-1", "namespace": "networco-db" },
+    "spec": {
+      "nodeName": "srv01",
+      "containers": [
+        { "name": "postgres", "image": "ghcr.io/cloudnative-pg/postgresql:17.2",
+          "resources": { "requests": { "cpu": "100m", "memory": "256Mi" } } }
+      ],
+      "initContainers": [
+        { "name": "bootstrap-controller", "image": "ghcr.io/cloudnative-pg/operator:1.25.0",
+          "resources": { "requests": { "cpu": "500m", "memory": "512Mi" } } },
+        { "name": "plugin-barman-cloud", "restartPolicy": "Always",
+          "image": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.14.0",
+          "resources": { "requests": { "cpu": "50m", "memory": "128Mi" } } }
+      ]
+    },
+    "status": {
+      "containerStatuses": [
+        { "name": "postgres", "image": "ghcr.io/cloudnative-pg/postgresql:17.2@sha256:abc" }
+      ],
+      "initContainerStatuses": [
+        { "name": "bootstrap-controller", "image": "ghcr.io/cloudnative-pg/operator:1.25.0" },
+        { "name": "plugin-barman-cloud",
+          "image": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.14.0@sha256:def" }
+      ]
+    }
+  }]
+}"#;
+
+#[test]
+fn a_sidecar_is_nameable_like_any_other_container() {
+    let pods: crate::kube::List<crate::kube::Pod> =
+        serde_json::from_str(POD_WITH_SIDECAR).expect("a real pod shape should deserialize");
+    let images = crate::collect::pod_images(&pods);
+
+    let look = |container: &str| {
+        images
+            .get(&(
+                "networco-db".to_string(),
+                "pg-1".to_string(),
+                container.to_string(),
+            ))
+            .cloned()
+    };
+
+    // The sidecar is the one that mattered: the kubelet reports it as a
+    // running container, and without it the series carried image="unknown".
+    assert_eq!(
+        look("plugin-barman-cloud").as_deref(),
+        Some("ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.14.0@sha256:def"),
+        "a sidecar must be nameable, and from its resolved status image"
+    );
+    assert_eq!(
+        look("postgres").as_deref(),
+        Some("ghcr.io/cloudnative-pg/postgresql:17.2@sha256:abc")
+    );
+    assert!(look("bootstrap-controller").is_some());
+    assert_eq!(look("nonexistent"), None);
+}
+
+#[test]
+fn only_a_restart_always_init_container_counts_as_a_sidecar() {
+    // `restartPolicy` is camelCase in the API; getting that wrong would make
+    // every sidecar read as a plain init container and silently drop its
+    // requests back out of the pod's totals.
+    let pods: crate::kube::List<crate::kube::Pod> =
+        serde_json::from_str(POD_WITH_SIDECAR).expect("deserialize");
+    let spec = &pods.items[0].spec;
+
+    let sidecars: Vec<&str> = spec
+        .init_containers
+        .iter()
+        .filter(|c| c.is_sidecar())
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(sidecars, ["plugin-barman-cloud"]);
+
+    // An ordinary container carries no restartPolicy and is not a sidecar.
+    assert!(!spec.containers[0].is_sidecar());
+}

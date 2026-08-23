@@ -142,15 +142,37 @@ pub struct PodSpec {
     pub node_name: String,
     #[serde(default)]
     pub containers: Vec<Container>,
+    /// Sidecars live here, not in `containers`: since Kubernetes 1.28 a
+    /// container that runs alongside the workload for the pod's whole life
+    /// is an init container with `restartPolicy: Always`. The kubelet
+    /// reports it under `containers` in stats/summary all the same, so a
+    /// daemon that reads only `spec.containers` sees a running container
+    /// it cannot name.
+    #[serde(default)]
+    pub init_containers: Vec<Container>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Container {
     pub name: String,
     #[serde(default)]
     pub image: String,
     #[serde(default)]
     pub resources: Resources,
+    /// Only ever set on an init container, and only `Always` there, which
+    /// is what distinguishes a sidecar from a plain init container.
+    #[serde(default)]
+    pub restart_policy: Option<String>,
+}
+
+impl Container {
+    /// A sidecar holds its resources for the pod's whole life, so it
+    /// counts toward what the pod reserves. A plain init container has
+    /// finished by the time anything is scraped and does not.
+    pub fn is_sidecar(&self) -> bool {
+        self.restart_policy.as_deref() == Some("Always")
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -166,6 +188,8 @@ pub struct Resources {
 pub struct PodStatus {
     #[serde(default)]
     pub container_statuses: Vec<ContainerStatus>,
+    #[serde(default)]
+    pub init_container_statuses: Vec<ContainerStatus>,
 }
 
 #[derive(Deserialize)]

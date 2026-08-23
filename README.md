@@ -84,14 +84,20 @@ The matched-uptime figure above is the one to quote.
 The one-node, 21-pod row does not measure the change. Its series count went
 from 194 to 423 while its samples barely moved, so per-series cost spread over
 the same samples pushed its bytes a sample up rather than down. The extra
-series come from pod churn on that cluster which the daemon did not attribute
-to an image.
+series were a bug, found afterwards and fixed in `0.2.12`: **sidecars** — init
+containers with `restartPolicy: Always`, which the kubelet reports as running
+containers — were read from neither `spec.containers` nor
+`status.containerStatuses`, so their series carried `image="unknown"` and a
+second set appeared once the real image arrived. The two clusters running
+CloudNativePG also lost most of the CPU saving to it, because a container that
+can never be named kept the pod list refetching every scrape.
 
 CPU came down with the pod list, which is the largest read this makes. The
 107-pod cluster parses about 1.46 MiB of JSON a scrape, 0.89 MiB of it the pod
 list; at one refetch per ten scrapes its average went from 1.479 to 0.901
 millicores. The other three went 0.201 to 0.092, 0.149 to 0.097, and 0.437 to
-0.275.
+0.275. Two of those figures understate it — see the sidecar bug above, which
+kept the pod list refetching every scrape wherever one was running.
 
 Working set and RSS have separated on the two clusters whose snapshot volume is
 a hostPath — 1.9 and 2.6 MiB apart, against 0.3 and 0.5 MiB on the two backed
