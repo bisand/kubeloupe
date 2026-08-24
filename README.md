@@ -21,7 +21,7 @@ actually generates.
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
 | VictoriaMetrics + node-exporter + kube-state-metrics | 50.6 MB | ~170 MB |
-| **kubeloupe** | **2.0 MB** | **3.6-9.9 MiB** |
+| **kubeloupe** | **2.0 MB** | **4.7-9.6 MiB** |
 
 Samples are the entire footprint, so they are compressed. Timestamps and
 values become varint delta streams, and the values are first recovered as
@@ -88,16 +88,30 @@ series were a bug, found afterwards and fixed in `0.2.12`: **sidecars** — init
 containers with `restartPolicy: Always`, which the kubelet reports as running
 containers — were read from neither `spec.containers` nor
 `status.containerStatuses`, so their series carried `image="unknown"` and a
-second set appeared once the real image arrived. The two clusters running
-CloudNativePG also lost most of the CPU saving to it, because a container that
-can never be named kept the pod list refetching every scrape.
+second set appeared once the real image arrived. A day on `0.2.12` says the
+read is right: every `plugin-barman-cloud` sidecar on the two clusters running
+CloudNativePG now carries its real image, and none of the four has a series
+left unnamed. What still turns up is a single sample against `image="unknown"`
+when a rollout or a CronJob puts a genuinely new container on a node — one
+scrape before the list is refetched, which is the window the staleness guard
+is built to leave rather than a case it misses.
 
 CPU came down with the pod list, which is the largest read this makes. The
 107-pod cluster parses about 1.46 MiB of JSON a scrape, 0.89 MiB of it the pod
 list; at one refetch per ten scrapes its average went from 1.479 to 0.901
 millicores. The other three went 0.201 to 0.092, 0.149 to 0.097, and 0.437 to
-0.275. Two of those figures understate it — see the sidecar bug above, which
-kept the pod list refetching every scrape wherever one was running.
+0.275.
+
+Two of those were read as understating the saving, on the theory that the
+sidecar bug kept the pod list refetching every scrape wherever one was
+running. A day of `0.2.12` does not bear that out. With the sidecars named
+and the refetching stopped, the same four sit at 0.090, 0.089, 0.265 and
+about 0.90 millicores — `0.2.11` again, within a few percent. The gap that
+looked like refetch cost was the statistic rather than the code: these are
+medians, and the figures it was compared against were means over a longer
+window, which an occasional client sweeping all four clusters at once lifts
+and a median does not. Naming a container costs a hash lookup either way.
+`0.2.12` corrects what the series say, not what they cost.
 
 Working set and RSS have separated on the two clusters whose snapshot volume is
 a hostPath — 1.9 and 2.6 MiB apart, against 0.3 and 0.5 MiB on the two backed
