@@ -170,11 +170,12 @@ pub fn parse_targets(spec: &str, root: &Path) -> Result<Vec<Target>> {
     Ok(targets)
 }
 
-/// `90m`, `24h`, `7d`, or a bare number of hours. Seconds.
+/// `30s`, `90m`, `24h`, `7d`, or a bare number of hours. Seconds.
 pub fn parse_duration(s: &str) -> Option<i64> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let n: i64 = s[..split].parse().ok()?;
     let unit = match &s[split..] {
+        "s" => 1,
         "m" => 60,
         "" | "h" => 3600,
         "d" => DAY,

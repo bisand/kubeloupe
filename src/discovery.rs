@@ -19,14 +19,14 @@
 //! that [`crate::promql`] rejects.
 
 use crate::api::{Shared, bad_data};
-use crate::promql::{Expr, Selector, eval, parser};
-use crate::store::{Labels, Series, Store};
+use crate::promql::{Expr, Selector, parser};
+use crate::store::{Labels, Store};
 use axum::extract::{Path, RawQuery, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 pub fn router() -> Router<Shared> {
     Router::new()
@@ -79,32 +79,18 @@ fn parse_args(raw: &str) -> Result<Args, String> {
     Ok(args)
 }
 
-/// Series matching any selector, deduplicated, restricted to those with a
-/// sample inside the window. The window matters: without it a node that
-/// was drained yesterday keeps appearing in Grafana's variable dropdown
-/// for as long as retention holds it.
-fn matching<'a>(store: &'a Store, args: &Args) -> Vec<&'a Series> {
-    let in_window = |series: &Series| match (series.first_t(), series.last_t()) {
-        (Some(first), Some(last)) => {
-            args.start.is_none_or(|start| last >= start) && args.end.is_none_or(|end| first <= end)
-        }
-        _ => false,
-    };
-
-    if args.selectors.is_empty() {
-        return store.series_iter().filter(|s| in_window(s)).collect();
-    }
-
-    let mut seen: HashSet<&Labels> = HashSet::new();
-    let mut out = Vec::new();
-    for selector in &args.selectors {
-        for series in eval::select(store, selector) {
-            if in_window(series) && seen.insert(&series.labels) {
-                out.push(series);
-            }
-        }
-    }
-    out
+/// Label sets matching any selector, restricted to those with a sample
+/// inside the window. The window matters: without it a node that was
+/// drained yesterday keeps appearing in Grafana's variable dropdown for as
+/// long as retention holds it. Unbounded, it is everything in memory, and
+/// with a disk tier the last hour of that too -- a year of files is not
+/// read for a dropdown.
+fn matching(store: &Store, args: &Args) -> Vec<Labels> {
+    let from = args.start.unwrap_or(match store.disk {
+        Some(_) => crate::now() - 3600,
+        None => i64::MIN,
+    });
+    store.label_sets(&args.selectors, from, args.end.unwrap_or(i64::MAX))
 }
 
 async fn labels(store: Shared, raw: &str) -> Response {
@@ -114,9 +100,10 @@ async fn labels(store: Shared, raw: &str) -> Response {
     };
 
     let store = store.read().await;
-    let names: BTreeSet<&str> = matching(&store, &args)
-        .into_iter()
-        .flat_map(|series| series.labels.keys().map(String::as_str))
+    let found = matching(&store, &args);
+    let names: BTreeSet<&str> = found
+        .iter()
+        .flat_map(|labels| labels.keys().map(String::as_str))
         .collect();
 
     success(json!(names))
@@ -129,9 +116,10 @@ async fn values(store: Shared, name: &str, raw: &str) -> Response {
     };
 
     let store = store.read().await;
-    let values: BTreeSet<&str> = matching(&store, &args)
-        .into_iter()
-        .filter_map(|series| series.labels.get(name).map(String::as_str))
+    let found = matching(&store, &args);
+    let values: BTreeSet<&str> = found
+        .iter()
+        .filter_map(|labels| labels.get(name).map(String::as_str))
         .collect();
 
     success(json!(values))
@@ -150,12 +138,7 @@ async fn series(store: Shared, raw: &str) -> Response {
     }
 
     let store = store.read().await;
-    let out: Vec<&Labels> = matching(&store, &args)
-        .into_iter()
-        .map(|series| &series.labels)
-        .collect();
-
-    success(json!(out))
+    success(json!(matching(&store, &args)))
 }
 
 async fn metadata() -> Response {

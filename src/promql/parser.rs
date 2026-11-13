@@ -1,6 +1,6 @@
 //! Tokeniser and recursive-descent parser for the subset in `mod.rs`.
 
-use super::{BinOp, Expr, MatchOp, Matcher, Selector};
+use super::{AggOp, BinOp, Expr, MatchOp, Matcher, RangeFn, Selector};
 use anyhow::{Context, Result, anyhow, bail};
 use regex_lite::Regex;
 
@@ -20,6 +20,12 @@ enum Token {
     Ne,
     Re,
     NotRe,
+    /// `==`, which compares, as opposed to `=`, which matches a label.
+    EqEq,
+    Gt,
+    Lt,
+    Ge,
+    Le,
     Plus,
     Minus,
     Star,
@@ -56,6 +62,17 @@ fn lex(input: &str) -> Result<Vec<Token>> {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                 i += 1;
+            }
+            // `1e6`, but not the `d` of a `[30d]` duration.
+            let digit_at = |j: usize| chars.get(j).is_some_and(|c| c.is_ascii_digit());
+            if matches!(chars.get(i), Some('e' | 'E')) {
+                let sign = usize::from(matches!(chars.get(i + 1), Some('+' | '-')));
+                if digit_at(i + 1 + sign) {
+                    i += 1 + sign;
+                    while digit_at(i) {
+                        i += 1;
+                    }
+                }
             }
             let text: String = chars[start..i].iter().collect();
             out.push(Token::Number(text.parse().context("bad number")?));
@@ -98,7 +115,11 @@ fn lex(input: &str) -> Result<Vec<Token>> {
             ('=', Some('~')) => (Token::Re, 2),
             ('!', Some('~')) => (Token::NotRe, 2),
             ('!', Some('=')) => (Token::Ne, 2),
-            ('=', Some('=')) => (Token::Eq, 2),
+            ('=', Some('=')) => (Token::EqEq, 2),
+            ('>', Some('=')) => (Token::Ge, 2),
+            ('<', Some('=')) => (Token::Le, 2),
+            ('>', _) => (Token::Gt, 1),
+            ('<', _) => (Token::Lt, 1),
             ('=', _) => (Token::Eq, 1),
             ('(', _) => (Token::LParen, 1),
             (')', _) => (Token::RParen, 1),
@@ -122,7 +143,11 @@ fn lex(input: &str) -> Result<Vec<Token>> {
 
 pub fn parse(input: &str) -> Result<Expr> {
     let tokens = lex(input)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        selectors: 0,
+    };
     let expr = parser.parse_expr(0)?;
     if parser.pos != parser.tokens.len() {
         bail!("trailing tokens after expression");
@@ -133,6 +158,8 @@ pub fn parse(input: &str) -> Result<Expr> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// How many selectors have been parsed: the next one's id.
+    selectors: usize,
 }
 
 impl Parser {
@@ -155,17 +182,26 @@ impl Parser {
         }
     }
 
-    /// Precedence climbing. `+`/`-` bind at 1, `*`/`/` at 2 -- enough for
-    /// `A - (B + C)` and for the division Lens uses in a few ratios.
+    /// Precedence climbing, loosest first as in Prometheus: `or`, then
+    /// `and`/`unless`, comparisons, `+`/`-`, and `*`/`/`.
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.parse_atom()?;
 
         while let Some(token) = self.peek() {
             let (op, bp) = match token {
-                Token::Plus => (BinOp::Add, 1),
-                Token::Minus => (BinOp::Sub, 1),
-                Token::Star => (BinOp::Mul, 2),
-                Token::Slash => (BinOp::Div, 2),
+                Token::Ident(word) if word == "or" => (BinOp::Or, 1),
+                Token::Ident(word) if word == "and" => (BinOp::And, 2),
+                Token::Ident(word) if word == "unless" => (BinOp::Unless, 2),
+                Token::EqEq => (BinOp::Eq, 3),
+                Token::Ne => (BinOp::Ne, 3),
+                Token::Gt => (BinOp::Gt, 3),
+                Token::Lt => (BinOp::Lt, 3),
+                Token::Ge => (BinOp::Ge, 3),
+                Token::Le => (BinOp::Le, 3),
+                Token::Plus => (BinOp::Add, 4),
+                Token::Minus => (BinOp::Sub, 4),
+                Token::Star => (BinOp::Mul, 5),
+                Token::Slash => (BinOp::Div, 5),
                 _ => break,
             };
             if bp < min_bp {
@@ -191,50 +227,101 @@ impl Parser {
                 Ok(inner)
             }
             Some(Token::Number(n)) => Ok(Expr::Number(n)),
+            // `-x` is `0 - x`; only ever a sign on a number or a series.
+            Some(Token::Minus) => Ok(Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Number(0.0)),
+                rhs: Box::new(self.parse_atom()?),
+            }),
             // A bare `{...}` selector, as in the podUsage query.
             Some(Token::LBrace) => {
                 let matchers = self.parse_matchers()?;
-                Ok(Expr::Selector(selector_from(None, matchers)))
+                Ok(Expr::Selector(self.selector(None, matchers)))
             }
-            Some(Token::Ident(name)) => match name.as_str() {
-                "sum" => self.parse_sum(),
-                "rate" | "irate" => self.parse_rate(),
-                _ => {
-                    let matchers = if self.peek() == Some(&Token::LBrace) {
+            Some(Token::Ident(name)) => {
+                // A word followed by `(` is a call; otherwise it is a
+                // metric name, even one spelled like a function.
+                let call = self.peek() == Some(&Token::LParen)
+                    || self.peek() == Some(&Token::Ident("by".into()))
+                    || self.peek() == Some(&Token::Ident("without".into()));
+                match name.as_str() {
+                    "sum" if call => self.parse_agg(AggOp::Sum),
+                    "avg" if call => self.parse_agg(AggOp::Avg),
+                    "min" if call => self.parse_agg(AggOp::Min),
+                    "max" if call => self.parse_agg(AggOp::Max),
+                    "count" if call => self.parse_agg(AggOp::Count),
+                    "rate" if call => self.parse_range(RangeFn::Rate),
+                    "irate" if call => self.parse_range(RangeFn::Irate),
+                    "increase" if call => self.parse_range(RangeFn::Increase),
+                    "clamp_min" | "clamp_max" if call => {
                         self.pos += 1;
-                        self.parse_matchers()?
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(Expr::Selector(selector_from(Some(name), matchers)))
+                        let expr = self.parse_expr(0)?;
+                        self.expect(Token::Comma)?;
+                        let bound = self.parse_expr(0)?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::Clamp {
+                            expr: Box::new(expr),
+                            bound: Box::new(bound),
+                            min: name == "clamp_min",
+                        })
+                    }
+                    "vector" if call => {
+                        self.pos += 1;
+                        let inner = self.parse_expr(0)?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::Vector(Box::new(inner)))
+                    }
+                    "time" if call => {
+                        self.pos += 1;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::Time)
+                    }
+                    _ if call => bail!("unsupported function {name}()"),
+                    _ => {
+                        let matchers = if self.peek() == Some(&Token::LBrace) {
+                            self.pos += 1;
+                            self.parse_matchers()?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok(Expr::Selector(self.selector(Some(name), matchers)))
+                    }
                 }
-            },
+            }
             other => bail!("unexpected token {other:?}"),
         }
     }
 
-    fn parse_sum(&mut self) -> Result<Expr> {
+    fn parse_agg(&mut self, op: AggOp) -> Result<Expr> {
         // `sum by (x) (expr)` and `sum(expr) by (x)` are both legal
-        // PromQL. Lens emits the second, but accepting both costs four
-        // lines and removes a way for this to break later.
-        let leading_by = self.take_by()?;
+        // PromQL. Lens emits the second, Grafana users the first.
+        let leading = self.take_by()?;
         self.expect(Token::LParen)?;
         let inner = self.parse_expr(0)?;
         self.expect(Token::RParen)?;
-        let by = match leading_by {
-            Some(by) => Some(by),
-            None => self.take_by()?,
+        let (by, without) = match leading {
+            Some(clause) => (Some(clause.0), clause.1),
+            None => match self.take_by()? {
+                Some(clause) => (Some(clause.0), clause.1),
+                None => (None, false),
+            },
         };
-        Ok(Expr::Sum {
+        Ok(Expr::Agg {
+            op,
             expr: Box::new(inner),
             by,
+            without,
         })
     }
 
-    fn take_by(&mut self) -> Result<Option<Vec<String>>> {
-        if self.peek() != Some(&Token::Ident("by".to_string())) {
-            return Ok(None);
-        }
+    /// A `by (...)` or `without (...)` clause: the labels, and whether it
+    /// was `without`.
+    fn take_by(&mut self) -> Result<Option<(Vec<String>, bool)>> {
+        let without = match self.peek() {
+            Some(Token::Ident(word)) if word == "by" => false,
+            Some(Token::Ident(word)) if word == "without" => true,
+            _ => return Ok(None),
+        };
         self.pos += 1;
         self.expect(Token::LParen)?;
         let mut labels = Vec::new();
@@ -250,30 +337,53 @@ impl Parser {
                 other => bail!("expected , or ) in by(), found {other:?}"),
             }
         }
-        Ok(Some(labels))
+        Ok(Some((labels, without)))
     }
 
-    fn parse_rate(&mut self) -> Result<Expr> {
+    fn parse_range(&mut self, func: RangeFn) -> Result<Expr> {
         self.expect(Token::LParen)?;
-        let name = match self.next() {
-            Some(Token::Ident(name)) => Some(name),
-            Some(Token::LBrace) => {
-                let matchers = self.parse_matchers()?;
-                let window = self.parse_window()?;
-                self.expect(Token::RParen)?;
-                return Ok(Expr::Rate(selector_from(None, matchers), window));
+        let (name, matchers) = match self.next() {
+            Some(Token::Ident(name)) => {
+                let matchers = if self.peek() == Some(&Token::LBrace) {
+                    self.pos += 1;
+                    self.parse_matchers()?
+                } else {
+                    Vec::new()
+                };
+                (Some(name), matchers)
             }
-            other => bail!("rate() expects a selector, found {other:?}"),
-        };
-        let matchers = if self.peek() == Some(&Token::LBrace) {
-            self.pos += 1;
-            self.parse_matchers()?
-        } else {
-            Vec::new()
+            Some(Token::LBrace) => (None, self.parse_matchers()?),
+            other => bail!("{func:?} expects a selector, found {other:?}"),
         };
         let window = self.parse_window()?;
         self.expect(Token::RParen)?;
-        Ok(Expr::Rate(selector_from(name, matchers), window))
+        Ok(Expr::Range {
+            func,
+            selector: self.selector(name, matchers),
+            window,
+        })
+    }
+
+    /// Folds an `__name__="x"` matcher into the selector's name field so
+    /// the store can use its index. A regex on `__name__` stays a matcher.
+    fn selector(&mut self, name: Option<String>, matchers: Vec<Matcher>) -> Selector {
+        let mut name = name;
+        let mut kept = Vec::with_capacity(matchers.len());
+
+        for matcher in matchers {
+            if matcher.label == crate::store::NAME_LABEL && matcher.op == MatchOp::Eq {
+                name = Some(matcher.value);
+                continue;
+            }
+            kept.push(matcher);
+        }
+
+        self.selectors += 1;
+        Selector {
+            name,
+            matchers: kept,
+            id: self.selectors - 1,
+        }
     }
 
     fn parse_window(&mut self) -> Result<i64> {
@@ -346,25 +456,5 @@ impl Parser {
         }
 
         Ok(out)
-    }
-}
-
-/// Folds an `__name__="x"` matcher into the selector's name field so the
-/// store can use its index. A regex on `__name__` stays a matcher.
-fn selector_from(name: Option<String>, matchers: Vec<Matcher>) -> Selector {
-    let mut name = name;
-    let mut kept = Vec::with_capacity(matchers.len());
-
-    for matcher in matchers {
-        if matcher.label == crate::store::NAME_LABEL && matcher.op == MatchOp::Eq {
-            name = Some(matcher.value);
-            continue;
-        }
-        kept.push(matcher);
-    }
-
-    Selector {
-        name,
-        matchers: kept,
     }
 }

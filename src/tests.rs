@@ -1439,3 +1439,236 @@ fn only_a_restart_always_init_container_counts_as_a_sidecar() {
     // An ordinary container carries no restartPolicy and is not a sidecar.
     assert!(!spec.containers[0].is_sidecar());
 }
+
+// --- Grafana ---------------------------------------------------------------
+//
+// Every query on the Glugg dashboards, its alerts and its admin console, as
+// written there (bisand/hetzner platform/dashboards.py, glugg src/admin.rs).
+// They are what a kubeloupe standing in for VictoriaMetrics has to answer.
+
+const GRAFANA_QUERIES: &[&str] = &[
+    "sum(glugg_participants)",
+    "sum(glugg_participants_relayed)",
+    "sum(glugg_participants_relayed) / clamp_min(sum(glugg_participants), 1)",
+    "sum(glugg_rooms)",
+    r#"sum(rate(glugg_media_bytes_total{dir="out"}[30s])) * 8 / 1e6"#,
+    r#"count(up{job="glugg"} == 1)"#,
+    "glugg_participants",
+    "glugg_participants_relayed",
+    "sum by (size) (glugg_rooms_by_size)",
+    "sum(rate(glugg_joins_total[1m])) * 60",
+    "sum(rate(glugg_refused_total[1m])) * 60",
+    "sum(rate(glugg_redirects_total[1m])) * 60",
+    r#"rate(glugg_media_bytes_total{dir="out"}[30s]) * 8 / 1e6"#,
+    r#"rate(glugg_media_bytes_total{dir="in"}[30s]) * 8 / 1e6"#,
+    r#"rate(node_network_transmit_bytes_total{device="eth0"}[30s]) * 8 / 1e6"#,
+    r#"rate(node_network_receive_bytes_total{device="eth0"}[30s]) * 8 / 1e6"#,
+    r#"increase(node_network_transmit_bytes_total{device="eth0"}[30d])"#,
+    "rate(glugg_dropped_total[30s])",
+    "glugg_sockets",
+    "sum by (result) (rate(glugg_tls_total[1m])) * 60",
+    "sum(rate(glugg_stun_total[1m])) * 60",
+    "sum by (result) (increase(glugg_mail_total[1h]))",
+    "sum by (result) (increase(glugg_push_total[1h]))",
+    "sum by (instance) (increase(glugg_db_errors_total[1h]))",
+    "glugg_info",
+    r#"100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100"#,
+    "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+    "node_load1",
+    r#"avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[1m])) * 100"#,
+    r#"rate(node_network_transmit_bytes_total{device="enp7s0"}[1m]) * 8 / 1e6"#,
+    "sum by (instance) (rate(node_network_receive_drop_total[1m]) + rate(node_network_transmit_drop_total[1m]) + rate(node_network_receive_errs_total[1m]) + rate(node_network_transmit_errs_total[1m]))",
+    "node_sockstat_TCP_inuse",
+    r#"100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})"#,
+    "sum by (instance) (rate(node_disk_written_bytes_total[1m]))",
+    r#"sum(kube_pod_status_ready{condition="false"}) or vector(0)"#,
+    "sum(increase(kube_pod_container_status_restarts_total[24h]))",
+    r#"sum(kube_node_status_condition{condition="Ready",status="true"})"#,
+    "count(up == 0) or vector(0)",
+    "sum by (namespace, pod) (rate(container_cpu_usage_seconds_total[2m]))",
+    "sum by (namespace, pod) (container_memory_working_set_bytes)",
+    "increase(kube_pod_container_status_restarts_total[24h]) > 0",
+    "sum by (job) (up)",
+    "sum(cnpg_collector_up)",
+    r#"max(cnpg_pg_database_size_bytes{datname="glugg"})"#,
+    "time() - max(cnpg_pg_stat_archiver_last_archived_time)",
+    "time() - max(cnpg_collector_last_available_backup_timestamp)",
+    "cnpg_pg_replication_lag",
+    "sum by (instance, state) (cnpg_backends_total)",
+    r#"sum(rate(cnpg_pg_stat_database_xact_commit{datname="glugg"}[2m]))"#,
+    "max(cnpg_pg_stat_archiver_failed_count)",
+    r#"min by (instance) (up{job="glugg"})"#,
+    r#"min by (node) (kube_node_status_condition{condition="Ready",status="true"})"#,
+    r#"sum by (instance) (rate(glugg_media_bytes_total{dir="out"}[5m])) * 8 / 1e6"#,
+    // What Grafana sends to test a data source.
+    "1+1",
+];
+
+#[test]
+fn every_grafana_query_parses() {
+    for query in GRAFANA_QUERIES {
+        parser::parse(query).unwrap_or_else(|e| panic!("failed to parse {query:?}: {e:#}"));
+    }
+}
+
+/// Two boxes over an hour at 10 s: box-a up, box-b down; counters rising
+/// at known rates.
+fn grafana_fixture() -> Store {
+    let mut store = Store::new(86_400 * 40);
+    for t in (0..=3_600).step_by(10) {
+        let n = t as f64 / 10.0;
+        for (instance, up) in [("box-a", 1.0), ("box-b", 0.0)] {
+            store.append(
+                labels("up", &[("job", "glugg"), ("instance", instance)]),
+                t,
+                up,
+            );
+            store.append(
+                labels(
+                    "glugg_participants",
+                    &[("job", "glugg"), ("instance", instance)],
+                ),
+                t,
+                3.0,
+            );
+            store.append(
+                labels(
+                    "node_cpu_seconds_total",
+                    &[("instance", instance), ("cpu", "0"), ("mode", "idle")],
+                ),
+                t,
+                n * 7.5, // 0.75 idle over 10 s
+            );
+            store.append(
+                labels(
+                    "node_cpu_seconds_total",
+                    &[("instance", instance), ("cpu", "1"), ("mode", "idle")],
+                ),
+                t,
+                n * 2.5, // 0.25 idle
+            );
+        }
+        store.append(labels("glugg_rooms", &[("instance", "box-a")]), t, 2.0);
+        store.append(
+            labels("glugg_joins_total", &[("instance", "box-a")]),
+            t,
+            n * 5.0,
+        );
+        store.append(
+            labels(
+                "cnpg_collector_last_available_backup_timestamp",
+                &[("instance", "db-1")],
+            ),
+            t,
+            3_000.0,
+        );
+        store.append(
+            labels(
+                "kube_pod_status_ready",
+                &[("pod", "p"), ("condition", "true")],
+            ),
+            t,
+            1.0,
+        );
+    }
+    store
+}
+
+fn scalar_or_one(store: &Store, query: &str, at: i64) -> Vec<(crate::store::Labels, f64)> {
+    let expr = parser::parse(query).unwrap_or_else(|e| panic!("parse {query:?}: {e:#}"));
+    match eval::eval(store, &expr, at) {
+        eval::Value::Vector(mut v) => {
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        }
+        eval::Value::Scalar(s) => vec![(crate::store::Labels::new(), s)],
+    }
+}
+
+#[test]
+fn grafana_queries_answer_what_prometheus_would() {
+    let store = grafana_fixture();
+    let at = 3_600;
+    let one = |q: &str| {
+        let v = scalar_or_one(&store, q, at);
+        assert_eq!(v.len(), 1, "{q}: {} series", v.len());
+        v[0].1
+    };
+
+    assert_eq!(one(r#"count(up{job="glugg"} == 1)"#), 1.0);
+    assert_eq!(one("count(up == 0) or vector(0)"), 1.0);
+    assert_eq!(
+        one(r#"sum(kube_pod_status_ready{condition="false"}) or vector(0)"#),
+        0.0
+    );
+    assert_eq!(one("sum(glugg_participants)"), 6.0);
+    assert_eq!(
+        one("sum(glugg_rooms) / clamp_min(sum(glugg_participants), 1)"),
+        2.0 / 6.0
+    );
+    assert_eq!(one("clamp_min(sum(nothing_here) or vector(0), 1)"), 1.0);
+    assert_eq!(one("sum(rate(glugg_joins_total[1m])) * 60"), 30.0);
+    assert_eq!(one("sum(increase(glugg_joins_total[1h]))"), 1_800.0);
+    assert_eq!(
+        one("time() - max(cnpg_collector_last_available_backup_timestamp)"),
+        600.0
+    );
+    assert_eq!(one("1+1"), 2.0);
+    assert_eq!(one("2 * 1e3 - 5e-1"), 1_999.5);
+    assert_eq!(one("-sum(glugg_rooms)"), -2.0);
+    assert_eq!(one("max(glugg_participants) > 2"), 3.0);
+    assert!(scalar_or_one(&store, "max(glugg_participants) > 3", at).is_empty());
+    assert_eq!(
+        one(r#"min by (instance) (up{job="glugg",instance="box-b"})"#),
+        0.0
+    );
+    assert_eq!(
+        one(r#"sum without (cpu, mode, instance) (rate(node_cpu_seconds_total[1m]))"#),
+        2.0
+    );
+
+    // CPU busy per box: two cores idle 0.75 and 0.25 of the time -> 50 % busy.
+    let busy = scalar_or_one(
+        &store,
+        r#"100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100"#,
+        at,
+    );
+    assert_eq!(busy.len(), 2);
+    for (labels, value) in busy {
+        assert_eq!(labels.len(), 1, "grouped by instance only: {labels:?}");
+        assert!((value - 50.0).abs() < 1e-9, "{value}");
+    }
+
+    // Names are not part of matching: these share both label sets.
+    assert_eq!(
+        scalar_or_one(&store, "up and glugg_participants", at).len(),
+        2
+    );
+    assert!(scalar_or_one(&store, "up and glugg_rooms", at).is_empty());
+    let unless = scalar_or_one(&store, r#"up unless up{instance="box-a"}"#, at);
+    assert_eq!(unless.len(), 1);
+}
+
+#[test]
+fn a_range_widens_a_narrow_window_to_its_step() {
+    // rate(x[30s]) charted at a one-hour step averages each hour, as
+    // VictoriaMetrics does, rather than sampling 30 s of it.
+    let mut store = Store::new(86_400 * 2);
+    let mut v = 0.0;
+    for t in (0..=86_400).step_by(10) {
+        // Fast for the first 10 minutes of every hour, idle the rest.
+        if t % 3_600 < 600 {
+            v += 60.0;
+        }
+        store.append(labels("c_total", &[]), t, v);
+    }
+    let expr = parser::parse("rate(c_total[30s])").unwrap();
+    let series = eval::query_range(&store, &expr, 7_200, 7_200 * 10, 3_600);
+    assert_eq!(series.len(), 1);
+    for (t, rate) in &series[0].values {
+        assert!(
+            (rate - 1.0).abs() < 0.02,
+            "at {t}: {rate}, want the hour's average of 1/s"
+        );
+    }
+}

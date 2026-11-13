@@ -47,6 +47,8 @@ async fn stats(State(store): State<Shared>) -> Json<serde_json::Value> {
     Json(json!({
         "series": store.series_count(),
         "samples": store.sample_count(),
+        "disk_bytes": store.disk.as_ref().map(|d| d.bytes()),
+        "disk_days": store.disk.as_ref().map(|d| d.days()),
     }))
 }
 
@@ -98,8 +100,16 @@ async fn range(store: Shared, params: Params) -> Response {
         return bad_data("exceeded maximum resolution of 11000 points per timeseries");
     }
 
-    let store = store.read().await;
-    let series = eval::query_range(&store, &expr, start, end, step);
+    // Off the runtime's one thread: with a disk tier a long range reads
+    // files, and scraping must not wait for it.
+    let Ok(series) = tokio::task::spawn_blocking(move || {
+        let store = store.blocking_read();
+        eval::query_range(&store, &expr, start, end, step)
+    })
+    .await
+    else {
+        return bad_data("the query failed");
+    };
 
     let result: Vec<serde_json::Value> = series
         .into_iter()
@@ -127,9 +137,16 @@ async fn instant(store: Shared, params: Params) -> Response {
         .as_deref()
         .and_then(parse_time)
         .unwrap_or_else(crate::now);
-    let store = store.read().await;
+    let Ok(value) = tokio::task::spawn_blocking(move || {
+        let store = store.blocking_read();
+        eval::eval(&store, &expr, at)
+    })
+    .await
+    else {
+        return bad_data("the query failed");
+    };
 
-    let result: Vec<serde_json::Value> = match eval::eval(&store, &expr, at) {
+    let result: Vec<serde_json::Value> = match value {
         eval::Value::Vector(v) => v
             .into_iter()
             .map(|(labels, value)| json!({ "metric": labels, "value": [at, format_value(value)] }))

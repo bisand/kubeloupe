@@ -1,9 +1,15 @@
-//! Evaluation of the parsed subset against the store.
+//! Evaluation of the parsed subset.
+//!
+//! A query is evaluated in two passes. First every selector in it reads
+//! its samples once, for the whole time range the query will look at --
+//! from memory and, when there is one, from the disk tier. Then each step
+//! of a range query evaluates against those, by binary search. Reading
+//! per step instead would decode the same chunks once per point, and on
+//! disk would read the same bytes a thousand times for a 30-day chart.
 
-use super::{BinOp, Expr, Selector};
-use crate::store::{Labels, NAME_LABEL, Store};
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use super::{AggOp, BinOp, Expr, RangeFn, Selector};
+use crate::store::{Labels, NAME_LABEL, Sample, Store};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// How stale a sample may be and still answer for an instant. Prometheus'
 /// default, and what makes a chart break rather than draw a flat line
@@ -24,139 +30,354 @@ impl Value {
     }
 }
 
+/// Every selector's series, by selector id, with the name already dropped:
+/// PromQL drops it from anything a function or operator touches, and
+/// matching two vectors line by line depends on it being gone.
+pub struct Fetched {
+    series: Vec<Vec<(Labels, Vec<Sample>)>>,
+    /// How far back an instant looks.
+    lookback: i64,
+    /// The step of a range query, 0 for an instant one. A window narrower
+    /// than this is widened to it, as VictoriaMetrics does, so that a
+    /// `rate(x[1m])` over a month averages each step rather than sampling
+    /// one minute of it.
+    step: i64,
+}
+
+/// Reads what `expr` needs to be evaluated anywhere in `[start, end]`.
+pub fn fetch(store: &Store, expr: &Expr, start: i64, end: i64, step: i64) -> Fetched {
+    let mut wanted = Vec::new();
+    selectors(expr, &mut wanted);
+    let widest = wanted.iter().filter_map(|(_, w)| *w).max().unwrap_or(0);
+
+    // Downsampled history has a point every few minutes: an instant that
+    // looks back less than two of those, or a window narrower than two,
+    // would find nothing there at all.
+    let resolution = store.resolution_since(start - widest.max(step) - LOOKBACK);
+    let mut fetched = Fetched {
+        series: Vec::new(),
+        lookback: LOOKBACK.max(step).max(2 * resolution),
+        step: step.max(2 * resolution),
+    };
+
+    for (selector, window) in wanted {
+        let reach = window.map_or(0, |w| fetched.window(w)) + fetched.lookback;
+        let mut found = store.fetch(selector, start - reach, end);
+        for (labels, _) in &mut found {
+            labels.remove(NAME_LABEL);
+        }
+        if fetched.series.len() <= selector.id {
+            fetched.series.resize_with(selector.id + 1, Vec::new);
+        }
+        fetched.series[selector.id] = found;
+    }
+    fetched
+}
+
+fn selectors<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Option<i64>)>) {
+    match expr {
+        Expr::Selector(selector) => out.push((selector, None)),
+        Expr::Range {
+            selector, window, ..
+        } => out.push((selector, Some(*window))),
+        Expr::Agg { expr, .. } | Expr::Vector(expr) => selectors(expr, out),
+        Expr::Clamp { expr, bound, .. } => {
+            selectors(expr, out);
+            selectors(bound, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            selectors(lhs, out);
+            selectors(rhs, out);
+        }
+        Expr::Time | Expr::Number(_) => {}
+    }
+}
+
+impl Fetched {
+    fn window(&self, window: i64) -> i64 {
+        window.max(self.step)
+    }
+
+    fn of(&self, selector: &Selector) -> &[(Labels, Vec<Sample>)] {
+        self.series
+            .get(selector.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+/// Instant query: evaluates `expr` at `t`.
 pub fn eval(store: &Store, expr: &Expr, t: i64) -> Value {
+    let fetched = fetch(store, expr, t, t, 0);
+    eval_at(&fetched, expr, t)
+}
+
+pub fn eval_at(data: &Fetched, expr: &Expr, t: i64) -> Value {
     match expr {
         Expr::Number(n) => Value::Scalar(*n),
+        Expr::Time => Value::Scalar(t as f64),
 
         Expr::Selector(selector) => {
             let mut out = Vec::new();
-            for series in select(store, selector) {
-                if let Some(v) = series.value_at(t, LOOKBACK) {
-                    out.push((without_name(&series.labels), v));
+            for (labels, samples) in data.of(selector) {
+                let idx = samples.partition_point(|s| s.t <= t);
+                if idx > 0 && t - samples[idx - 1].t <= data.lookback {
+                    out.push((labels.clone(), samples[idx - 1].v));
                 }
             }
             Value::Vector(out)
         }
 
-        Expr::Rate(selector, window) => {
+        Expr::Range {
+            func,
+            selector,
+            window,
+        } => {
+            let window = data.window(*window);
             let mut out = Vec::new();
-            for series in select(store, selector) {
-                let samples = series.range_at(t, *window);
-                if samples.len() < 2 {
-                    continue;
+            for (labels, samples) in data.of(selector) {
+                let begin = samples.partition_point(|s| s.t <= t - window);
+                let end = samples.partition_point(|s| s.t <= t);
+                let value = match func {
+                    RangeFn::Rate => rate(&samples[begin..end]),
+                    RangeFn::Irate => rate(&samples[begin.max(end.saturating_sub(2))..end]),
+                    // VictoriaMetrics' increase: from the last sample before
+                    // the window, when there is a recent one, so consecutive
+                    // windows add up to the whole and nothing falls between.
+                    RangeFn::Increase => {
+                        let from =
+                            if begin > 0 && (t - window) - samples[begin - 1].t <= data.lookback {
+                                begin - 1
+                            } else {
+                                begin
+                            };
+                        let part = &samples[from..end];
+                        (part.len() >= 2).then(|| delta(part))
+                    }
+                };
+                if let Some(value) = value {
+                    out.push((labels.clone(), value));
                 }
-                let span = samples[samples.len() - 1].t - samples[0].t;
-                if span <= 0 {
-                    continue;
-                }
-
-                // Counter-aware delta: a container restart resets its
-                // CPU counter, and a plain last-minus-first would render
-                // that as a large negative rate.
-                let mut delta = 0.0;
-                let mut prev = samples[0].v;
-                for sample in &samples[1..] {
-                    delta += if sample.v < prev {
-                        sample.v
-                    } else {
-                        sample.v - prev
-                    };
-                    prev = sample.v;
-                }
-
-                out.push((without_name(&series.labels), delta / span as f64));
             }
             Value::Vector(out)
         }
 
-        Expr::Sum { expr, by } => {
-            let input = eval(store, expr, t).into_vector();
-            let mut groups: HashMap<String, (Labels, f64)> = HashMap::new();
+        Expr::Agg {
+            op,
+            expr,
+            by,
+            without,
+        } => {
+            let input = eval_at(data, expr, t).into_vector();
+            let mut groups: HashMap<String, (Labels, f64, usize)> = HashMap::new();
 
             for (labels, value) in input {
-                // No `by` clause folds everything into one series. So does
+                // No clause folds everything into one series. So does
                 // `by (kubernetes_name)`, a label nothing here carries --
                 // which is exactly what Lens' cluster memory query wants.
-                let grouped = match by {
-                    Some(names) => {
-                        let mut kept = BTreeMap::new();
-                        for name in names {
-                            if let Some(v) = labels.get(name) {
-                                kept.insert(name.clone(), v.clone());
-                            }
-                        }
-                        kept
-                    }
-                    None => BTreeMap::new(),
+                let grouped: Labels = match (by, without) {
+                    (Some(names), false) => names
+                        .iter()
+                        .filter_map(|n| labels.get(n).map(|v| (n.clone(), v.clone())))
+                        .collect(),
+                    (Some(names), true) => labels
+                        .into_iter()
+                        .filter(|(k, _)| !names.contains(k))
+                        .collect(),
+                    (None, _) => BTreeMap::new(),
                 };
 
                 let key = key_of(&grouped);
                 groups
                     .entry(key)
-                    .and_modify(|(_, sum)| *sum += value)
-                    .or_insert((grouped, value));
+                    .and_modify(|(_, acc, n)| {
+                        *n += 1;
+                        *acc = match op {
+                            AggOp::Sum | AggOp::Avg => *acc + value,
+                            AggOp::Min => acc.min(value),
+                            AggOp::Max => acc.max(value),
+                            AggOp::Count => *n as f64,
+                        };
+                    })
+                    .or_insert_with(|| {
+                        let first = if *op == AggOp::Count { 1.0 } else { value };
+                        (grouped, first, 1)
+                    });
             }
 
-            Value::Vector(groups.into_values().collect())
+            Value::Vector(
+                groups
+                    .into_values()
+                    .map(|(labels, acc, n)| {
+                        let value = if *op == AggOp::Avg {
+                            acc / n as f64
+                        } else {
+                            acc
+                        };
+                        (labels, value)
+                    })
+                    .collect(),
+            )
         }
 
-        Expr::Binary { op, lhs, rhs } => {
-            let lhs = eval(store, lhs, t);
-            let rhs = eval(store, rhs, t);
-
-            match (lhs, rhs) {
-                (Value::Scalar(a), Value::Scalar(b)) => Value::Scalar(apply(*op, a, b)),
-                (Value::Vector(v), Value::Scalar(s)) => {
-                    Value::Vector(v.into_iter().map(|(l, x)| (l, apply(*op, x, s))).collect())
-                }
-                (Value::Scalar(s), Value::Vector(v)) => {
-                    Value::Vector(v.into_iter().map(|(l, x)| (l, apply(*op, s, x))).collect())
-                }
-                (Value::Vector(a), Value::Vector(b)) => {
-                    // One-to-one matching on the full label set, which is
-                    // what makes `MemTotal - (MemFree + Buffers + Cached)`
-                    // line up: every one of those carries the same
-                    // kubernetes_node and instance.
-                    let rhs_by_labels: HashMap<String, f64> =
-                        b.into_iter().map(|(l, v)| (key_of(&l), v)).collect();
-
-                    let mut out = Vec::new();
-                    for (labels, value) in a {
-                        if let Some(other) = rhs_by_labels.get(&key_of(&labels)) {
-                            out.push((labels, apply(*op, value, *other)));
-                        }
-                    }
-                    Value::Vector(out)
+        Expr::Clamp { expr, bound, min } => {
+            let Value::Scalar(bound) = eval_at(data, bound, t) else {
+                return Value::Vector(Vec::new());
+            };
+            let clamp = |v: f64| if *min { v.max(bound) } else { v.min(bound) };
+            match eval_at(data, expr, t) {
+                Value::Scalar(v) => Value::Scalar(clamp(v)),
+                Value::Vector(v) => {
+                    Value::Vector(v.into_iter().map(|(l, x)| (l, clamp(x))).collect())
                 }
             }
+        }
+
+        Expr::Vector(inner) => match eval_at(data, inner, t) {
+            Value::Scalar(v) => Value::Vector(vec![(Labels::new(), v)]),
+            vector => vector,
+        },
+
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs = eval_at(data, lhs, t);
+            let rhs = eval_at(data, rhs, t);
+            binary(*op, lhs, rhs)
         }
     }
 }
 
+fn binary(op: BinOp, lhs: Value, rhs: Value) -> Value {
+    if matches!(op, BinOp::And | BinOp::Or | BinOp::Unless) {
+        let (a, b) = (lhs.into_vector(), rhs.into_vector());
+        let keys =
+            |v: &[(Labels, f64)]| -> HashSet<String> { v.iter().map(|(l, _)| key_of(l)).collect() };
+        return Value::Vector(match op {
+            BinOp::And => {
+                let in_b = keys(&b);
+                a.into_iter()
+                    .filter(|(l, _)| in_b.contains(&key_of(l)))
+                    .collect()
+            }
+            BinOp::Unless => {
+                let in_b = keys(&b);
+                a.into_iter()
+                    .filter(|(l, _)| !in_b.contains(&key_of(l)))
+                    .collect()
+            }
+            _ => {
+                let in_a = keys(&a);
+                let mut out = a;
+                out.extend(b.into_iter().filter(|(l, _)| !in_a.contains(&key_of(l))));
+                out
+            }
+        });
+    }
+
+    match (lhs, rhs) {
+        (Value::Scalar(a), Value::Scalar(b)) => Value::Scalar(match compare(op, a, b) {
+            Some(holds) => f64::from(u8::from(holds)),
+            None => apply(op, a, b),
+        }),
+        (Value::Vector(v), Value::Scalar(s)) => Value::Vector(
+            v.into_iter()
+                .filter_map(|(l, x)| combine(op, x, s, x).map(|r| (l, r)))
+                .collect(),
+        ),
+        (Value::Scalar(s), Value::Vector(v)) => Value::Vector(
+            v.into_iter()
+                .filter_map(|(l, x)| combine(op, s, x, x).map(|r| (l, r)))
+                .collect(),
+        ),
+        (Value::Vector(a), Value::Vector(b)) => {
+            // One-to-one matching on the full label set, which is what
+            // makes `MemTotal - (MemFree + Buffers + Cached)` line up:
+            // every one of those carries the same kubernetes_node and
+            // instance.
+            let rhs_by_labels: HashMap<String, f64> =
+                b.into_iter().map(|(l, v)| (key_of(&l), v)).collect();
+
+            let mut out = Vec::new();
+            for (labels, value) in a {
+                if let Some(other) = rhs_by_labels.get(&key_of(&labels))
+                    && let Some(result) = combine(op, value, *other, value)
+                {
+                    out.push((labels, result));
+                }
+            }
+            Value::Vector(out)
+        }
+    }
+}
+
+/// Arithmetic gives its result; a comparison filters, keeping `keep` (the
+/// vector side's own value) where it holds.
+fn combine(op: BinOp, a: f64, b: f64, keep: f64) -> Option<f64> {
+    match compare(op, a, b) {
+        Some(true) => Some(keep),
+        Some(false) => None,
+        None => Some(apply(op, a, b)),
+    }
+}
+
+fn compare(op: BinOp, a: f64, b: f64) -> Option<bool> {
+    Some(match op {
+        BinOp::Eq => a == b,
+        BinOp::Ne => a != b,
+        BinOp::Gt => a > b,
+        BinOp::Lt => a < b,
+        BinOp::Ge => a >= b,
+        BinOp::Le => a <= b,
+        _ => return None,
+    })
+}
+
+/// Counter-aware delta: a container restart resets its CPU counter, and a
+/// plain last-minus-first would render that as a large negative rate.
+fn delta(samples: &[Sample]) -> f64 {
+    let mut delta = 0.0;
+    let mut prev = samples[0].v;
+    for sample in &samples[1..] {
+        delta += if sample.v < prev {
+            sample.v
+        } else {
+            sample.v - prev
+        };
+        prev = sample.v;
+    }
+    delta
+}
+
+fn rate(samples: &[Sample]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let span = samples[samples.len() - 1].t - samples[0].t;
+    (span > 0).then(|| delta(samples) / span as f64)
+}
+
+/// The series a selector matches in memory, for the discovery endpoints.
+/// Queries go through [`fetch`], which also reads disk.
 pub(crate) fn select<'a>(store: &'a Store, selector: &Selector) -> Vec<&'a crate::store::Series> {
     store
         .candidates(selector.name.as_deref())
         .into_iter()
-        .filter(|series| {
-            selector.matchers.iter().all(|matcher| {
-                // Prometheus treats an absent label as the empty string,
-                // which is what makes `container!=""` exclude the
-                // pod-level rollups rather than everything.
-                let value = series
-                    .labels
-                    .get(&matcher.label)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                matcher.matches(value)
-            })
-        })
+        .filter(|series| matches(selector, &series.labels))
         .collect()
 }
 
-fn without_name(labels: &Labels) -> Labels {
-    let mut out = labels.clone();
-    out.remove(NAME_LABEL);
-    out
+pub(crate) fn matches(selector: &Selector, labels: &Labels) -> bool {
+    if let Some(name) = &selector.name
+        && labels.get(NAME_LABEL) != Some(name)
+    {
+        return false;
+    }
+    selector.matchers.iter().all(|matcher| {
+        // Prometheus treats an absent label as the empty string, which is
+        // what makes `container!=""` exclude the pod-level rollups rather
+        // than everything.
+        let value = labels.get(&matcher.label).map(String::as_str).unwrap_or("");
+        matcher.matches(value)
+    })
 }
 
 fn key_of(labels: &Labels) -> String {
@@ -176,6 +397,7 @@ fn apply(op: BinOp, a: f64, b: f64) -> f64 {
         BinOp::Sub => a - b,
         BinOp::Mul => a * b,
         BinOp::Div => a / b,
+        _ => f64::NAN,
     }
 }
 
@@ -193,12 +415,13 @@ pub fn query_range(
     step: i64,
 ) -> Vec<RangeSeries> {
     let step = step.max(1);
+    let fetched = fetch(store, expr, start, end, step);
     let mut ordered: Vec<String> = Vec::new();
     let mut series: HashMap<String, RangeSeries> = HashMap::new();
 
     let mut t = start;
     while t <= end {
-        for (labels, value) in eval(store, expr, t).into_vector() {
+        for (labels, value) in eval_at(&fetched, expr, t).into_vector() {
             if !value.is_finite() {
                 continue;
             }

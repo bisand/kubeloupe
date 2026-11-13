@@ -105,6 +105,18 @@ impl Client {
             .await
     }
 
+    /// Pods matching a label selector, in one namespace or (empty) all.
+    pub async fn pods_selected(&self, namespace: &str, selector: &str) -> Result<List<Pod>> {
+        let scope = if namespace.is_empty() {
+            String::new()
+        } else {
+            format!("/namespaces/{namespace}")
+        };
+        let selector: String = form_urlencoded::byte_serialize(selector.as_bytes()).collect();
+        self.get(&format!("/api/v1{scope}/pods?labelSelector={selector}"))
+            .await
+    }
+
     /// A container's log with the kubelet's own timestamp on every line,
     /// from `since` (unix seconds) or, without one, the last `backlog`
     /// seconds. `previous` reads the run before the latest restart, which
@@ -250,6 +262,17 @@ pub struct Container {
     /// is what distinguishes a sidecar from a plain init container.
     #[serde(default)]
     pub restart_policy: Option<String>,
+    /// For scraping: a target may name its port rather than number it.
+    #[serde(default)]
+    pub ports: Vec<ContainerPort>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerPort {
+    #[serde(default)]
+    pub name: String,
+    pub container_port: u16,
 }
 
 impl Container {
@@ -272,6 +295,10 @@ pub struct Resources {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PodStatus {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default, rename = "podIP")]
+    pub pod_ip: String,
     #[serde(default)]
     pub container_statuses: Vec<ContainerStatus>,
     #[serde(default)]

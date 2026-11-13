@@ -19,8 +19,13 @@ actually generates.
 
 It can also keep the logs of pods you name, for as long as you say, as
 plain text files that outlive the pods -- see [Logs](#logs-for-the-pods-you-name).
-Off unless configured: an installation that doesn't ask for logs reads,
-writes and serves none.
+And it can stand in for a small Prometheus or VictoriaMetrics: scrape the
+exporters you name, keep only the metrics you list, and hold months of
+history on disk while memory holds an hour -- see
+[History on disk, and exporters](#history-on-disk-and-exporters).
+All of that is off unless configured: an installation that doesn't ask
+for it reads, writes and serves none of it, and stays the few megabytes
+it always was.
 
 | | image (compressed) | resident |
 | --- | ---: | ---: |
@@ -301,13 +306,23 @@ discovery endpoints are answered too — `/api/v1/labels`,
 state — they read label sets the store already holds — for about 25 KiB
 compressed.
 
-What that does **not** buy is the rest of Prometheus. The PromQL subset is
-still the one Lens generates: selectors, `rate()`, `sum() by ()` and
-arithmetic. `avg`, `count`, `histogram_quantile`, `topk`, `offset` and
-subqueries are a 422, so a prebuilt Kubernetes dashboard will mostly not
-render — it expects both the functions and the full
+What that does **not** buy is the rest of Prometheus. Beyond what Lens
+generates, the PromQL here is what hand-written dashboards and alerts
+mostly use: `sum`, `avg`, `min`, `max` and `count` with `by` or
+`without`; `rate`, `irate` and `increase`; comparisons (`== 1`, `> 0`)
+and `and`, `or`, `unless`; `clamp_min`, `clamp_max`, `vector()`,
+`time()`; and arithmetic. `histogram_quantile`, `topk`, `offset`,
+`on()`/`group_left` and subqueries are a 422, so a prebuilt Kubernetes
+dashboard will mostly not render — it expects both those and the full
 kube-state-metrics/node-exporter catalogue. Hand-written panels within the
 subset work.
+
+Two behaviours follow VictoriaMetrics rather than Prometheus, because they
+draw better charts. A range window narrower than the query's step is
+widened to the step, so `rate(x[1m])` over a month averages each point
+rather than sampling one minute of it. And `increase()` counts from the
+last sample before its window, so it is exact rather than extrapolated:
+`increase(x[1h])` at whole hours adds up to the day.
 
 `/api/v1/status/buildinfo` is deliberately **not** answered. Grafana probes
 it to decide which PromQL features to send, and a 404 makes it assume the
@@ -388,6 +403,61 @@ the cap is what keeps the disk in check.)
 To size it, a target needs about its pods' daily log volume times its days:
 `kubectl logs --since=24h <pod> | wc -c`.
 
+### History on disk, and exporters
+
+Off unless asked for. Two settings turn kubeloupe from Lens' backend into
+a small, general one -- enough to run Grafana on, as the Glugg cluster
+does in place of VictoriaMetrics:
+
+- **`SCRAPE_CONFIG`** names Prometheus exporters to read, as JSON (inline,
+  or the path of a file holding it):
+
+  ```json
+  [{ "job": "node", "every": "10s", "namespace": "monitoring",
+     "selector": "app=node-exporter", "port": 9100, "instance": "node",
+     "keep": "node_cpu_seconds_total|node_memory_(MemAvailable|MemTotal)_bytes|node_load1" },
+   { "job": "kube-state-metrics",
+     "url": "http://kube-state-metrics.monitoring.svc:8080/metrics",
+     "keep": "kube_pod_status_ready|kube_node_status_condition" }]
+  ```
+
+  A job is either one `url`, or the Running pods a label `selector` finds
+  (in `namespace`, or every namespace when it is left out), read at their
+  pod IP on `port` -- a number or a container port's name -- and `path`
+  (`/metrics`). Every series is labelled `job` and `instance`: the pod's
+  `node` or `pod` name (the default), or the URL's host and port. `every`
+  defaults to `SCRAPE_INTERVAL_SECONDS`. `keep` is a regex every metric
+  name must match whole: it is what keeps a node-exporter's thousand
+  series down to the dozen a dashboard reads, and so what keeps the store
+  small. `up` is always recorded, 1 or 0 per target. Plain HTTP only.
+
+- **`STORAGE_DIR`** keeps history on disk. Memory then holds only the
+  hour in progress: as each hour turns, every series is sealed and its
+  compressed chunks appended to that day's file, and memory lets go of
+  them. Queries read memory and files alike. Retention is
+  `STORAGE_RETENTION_DAYS` (30), and `STORAGE_MAX_MB` (1024) caps the
+  whole by dropping the oldest days first. Optionally, days older than
+  `STORAGE_DOWNSAMPLE_AFTER_DAYS` keep one point per
+  `STORAGE_DOWNSAMPLE_SECONDS` (300): the last of each, which is what
+  keeps `rate()` and `increase()` exact on a counter, at a fraction of the
+  size. A finished day is merged into one segment; nothing is ever
+  rewritten in place, and a rewrite goes to a temporary file renamed over
+  the old one. The hour in memory is snapshotted as usual (by default to
+  `head.snapshot` in the same directory), and a SIGTERM writes it to disk.
+
+There is no database underneath, on purpose. The memory store already
+packs samples into immutable compressed chunks, which is what a time
+series database writes anyway; a day file is a run of those, grouped by
+series, with a small table of metric names in front of each segment so a
+query reads only the names it asks for and only the chunks that overlap
+its range. The page cache does the caching. A general-purpose key-value
+store would cost ten times the bytes per sample and still need all of
+this on top.
+
+Sizing: bytes on disk are about samples per second x 86 400 x 1.3-3.5 per
+day. `/-/stats` reports `disk_bytes` and `disk_days`. The volume needs
+room for `STORAGE_MAX_MB` plus a day being rewritten.
+
 ## What it does not cover
 
 - **Per-container disk read/write rates.** `container_fs_reads_bytes_total`
@@ -446,7 +516,10 @@ window — so reading from disk would be constant I/O to serve a few MB.
 Compressing the samples was the cheaper answer by some margin: it removed
 about seven eighths of the memory without putting anything in the query
 path. One sequential write every few minutes keeps that path a pointer
-walk into a varint stream.
+walk into a varint stream. (For history longer than a day, the
+[disk tier](#history-on-disk-and-exporters) is the other answer: there the
+working set no longer fits, and the files are read only for the range a
+query asks for.)
 
 The file holds the store's compressed chunks verbatim, so it is about as
 small as the store is: a 673-series cluster's day of history is roughly
@@ -517,6 +590,16 @@ the manifest says later.
 | `LOG_DIR` | `/var/lib/kubeloupe/logs` | On the snapshot volume in the supplied manifest. |
 | `LOG_MAX_MB` | `32` | All targets' files together. Size the volume to match. |
 | `LOG_INTERVAL_SECONDS` | `15` | How often the pods are listed: how soon a new container's log is followed. Lines themselves arrive as they are written. |
+| `SCRAPE_CONFIG` | *(unset)* | Exporters to read, as JSON or a file path. Unset, none. See [History on disk, and exporters](#history-on-disk-and-exporters). |
+| `STORAGE_DIR` | *(unset)* | Keep history on disk here. Unset, it stays in memory for `RETENTION_HOURS`, which `STORAGE_RETENTION_DAYS` then replaces. |
+| `STORAGE_RETENTION_DAYS` | `30` | Whole days are deleted once past it. |
+| `STORAGE_MAX_MB` | `1024` | All days together; the oldest go first, never today. |
+| `STORAGE_DOWNSAMPLE_AFTER_DAYS` | *(unset)* | Days older than this keep one point per `STORAGE_DOWNSAMPLE_SECONDS`. Unset, every sample is kept. |
+| `STORAGE_DOWNSAMPLE_SECONDS` | `300` | |
+
+The supplied manifest reads every variable but `SNAPSHOT_PATH` from the
+ConfigMap `kubeloupe-config` when there is one, one key per variable, so a
+cluster keeps its settings there and the manifest stays the same.
 
 RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy` and `pods/log`.
 
@@ -571,7 +654,11 @@ The suite evaluates the real Lens query strings against a synthetic
 cluster and asserts the numbers — including failure modes that would be
 invisible in a chart: an unanchored pod regex silently summing `api-1`
 with `api-10`, a container restart reading as a negative rate, and a
-stale series flatlining instead of breaking the line.
+stale series flatlining instead of breaking the line. It does the same for
+every query on a real Grafana dashboard set and its alerts, and checks that
+history read back from disk -- merged, downsampled, reopened after a
+restart, or with a torn segment at its end -- answers exactly as memory
+would.
 
 ## The name
 

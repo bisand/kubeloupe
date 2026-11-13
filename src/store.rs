@@ -69,6 +69,7 @@ impl Series {
     /// The most recent sample at or before `t`, provided it is not staler
     /// than `lookback`. Prometheus' instant-vector rule, and the reason a
     /// chart flatlines rather than interpolating across a gap.
+    #[cfg(test)]
     pub fn value_at(&self, t: i64, lookback: i64) -> Option<f64> {
         // The head first: an instant query asks for `now`, which is the
         // one place that never costs a decode.
@@ -254,6 +255,8 @@ pub struct Store {
     /// `__name__` -> keys, so a named selector never scans the whole store.
     by_name: HashMap<String, Vec<String>>,
     retention: i64,
+    /// Where everything older than the hour in progress goes, when set.
+    pub disk: Option<crate::disk::Disk>,
 }
 
 impl Store {
@@ -262,7 +265,116 @@ impl Store {
             series: HashMap::new(),
             by_name: HashMap::new(),
             retention,
+            disk: None,
         }
+    }
+
+    /// Moves every sample in memory to the disk tier: heads are sealed and
+    /// all chunks appended as one segment, then memory lets go of them.
+    /// On a write error memory keeps them, to try again next time.
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        let Some(disk) = self.disk.as_mut() else {
+            return Ok(());
+        };
+        for series in self.series.values_mut() {
+            series.seal();
+        }
+        let batch: Vec<(&Labels, &[Chunk])> = self
+            .series
+            .values()
+            .map(|s| (&s.labels, s.chunks.as_slice()))
+            .collect();
+        disk.append(&batch)?;
+        self.series.clear();
+        self.by_name.clear();
+        Ok(())
+    }
+
+    /// The coarsest resolution of stored history newer than `t`.
+    pub fn resolution_since(&self, t: i64) -> i64 {
+        self.disk.as_ref().map_or(0, |d| d.resolution_since(t))
+    }
+
+    /// Every series a selector matches, with its samples in `[from, to]`,
+    /// from memory and disk together, oldest first.
+    pub fn fetch(
+        &self,
+        selector: &crate::promql::Selector,
+        from: i64,
+        to: i64,
+    ) -> Vec<(Labels, Vec<Sample>)> {
+        let mut found: HashMap<String, (Labels, Vec<Sample>)> = HashMap::new();
+        if let Some(disk) = &self.disk {
+            disk.read(
+                &|name| name_may_match(selector, name),
+                &|labels| crate::promql::eval::matches(selector, labels),
+                from,
+                to,
+                true,
+                &mut found,
+            );
+        }
+        for series in crate::promql::eval::select(self, selector) {
+            let samples = series.range_at(to, to - from + 1);
+            if samples.is_empty() {
+                continue;
+            }
+            found
+                .entry(canonical_key(&series.labels))
+                .or_insert_with(|| (series.labels.clone(), Vec::new()))
+                .1
+                .extend(samples);
+        }
+        found
+            .into_values()
+            .filter_map(|(labels, mut samples)| {
+                // Disk and memory overlap only after a crash replayed an
+                // hour already written; either copy will do.
+                samples.sort_by_key(|s| s.t);
+                samples.dedup_by_key(|s| s.t);
+                (!samples.is_empty()).then_some((labels, samples))
+            })
+            .collect()
+    }
+
+    /// The label sets with a sample in `[from, to]` matching any of
+    /// `selectors` (every series, when there are none), for the
+    /// discovery endpoints.
+    pub fn label_sets(
+        &self,
+        selectors: &[crate::promql::Selector],
+        from: i64,
+        to: i64,
+    ) -> Vec<Labels> {
+        let any = |labels: &Labels| {
+            selectors.is_empty()
+                || selectors
+                    .iter()
+                    .any(|s| crate::promql::eval::matches(s, labels))
+        };
+        let mut found: HashMap<String, (Labels, Vec<Sample>)> = HashMap::new();
+        if let Some(disk) = &self.disk {
+            disk.read(
+                &|name| selectors.is_empty() || selectors.iter().any(|s| name_may_match(s, name)),
+                &any,
+                from,
+                to,
+                false,
+                &mut found,
+            );
+        }
+        for series in self.series.values() {
+            let in_window = match (series.first_t(), series.last_t()) {
+                (Some(first), Some(last)) => last >= from && first <= to,
+                _ => false,
+            };
+            if in_window && any(&series.labels) {
+                found
+                    .entry(canonical_key(&series.labels))
+                    .or_insert_with(|| (series.labels.clone(), Vec::new()));
+            }
+        }
+        found.into_values().map(|(labels, _)| labels).collect()
     }
 
     pub fn append(&mut self, labels: Labels, t: i64, v: f64) {
@@ -378,7 +490,18 @@ impl Store {
     }
 }
 
-fn canonical_key(labels: &Labels) -> String {
+/// Whether a series of this name could match: `__name__` matchers decide,
+/// the rest need the labels.
+fn name_may_match(selector: &crate::promql::Selector, name: &str) -> bool {
+    selector.name.as_deref().is_none_or(|n| n == name)
+        && selector
+            .matchers
+            .iter()
+            .filter(|m| m.label == NAME_LABEL)
+            .all(|m| m.matches(name))
+}
+
+pub(crate) fn canonical_key(labels: &Labels) -> String {
     let mut key = String::new();
     for (k, v) in labels {
         key.push_str(k);

@@ -40,7 +40,8 @@ subjects:
     namespace: lens-metrics
 ---
 # 64Mi against a snapshot of roughly 1 MB at the default 24h retention,
-# plus up to LOG_MAX_MB (32) of logs if they are turned on --
+# plus up to LOG_MAX_MB (32) of logs if they are turned on, plus up to
+# STORAGE_MAX_MB of history if STORAGE_DIR is put here -- size it to match --
 # the file holds the store's compressed chunks verbatim. Sized well clear
 # of that because save() writes a temporary file beside the live one and
 # renames, so the peak is both together. No storageClassName, so it takes
@@ -100,22 +101,23 @@ spec:
           # tag, so a restart never depends on the registry being
           # reachable -- but a rebuilt node can still pull it.
           imagePullPolicy: IfNotPresent
+          # Every other setting -- SCRAPE_INTERVAL_SECONDS (30),
+          # RETENTION_HOURS (24), SNAPSHOT_INTERVAL_SECONDS (300), and the
+          # optional exporters and history on disk (SCRAPE_CONFIG,
+          # STORAGE_DIR, STORAGE_RETENTION_DAYS, ...) -- comes from the
+          # ConfigMap kubeloupe-config when it exists, one key per
+          # variable, so a cluster keeps its settings there and this file
+          # stays the same everywhere. See the README's Configuration.
+          #   kubectl -n lens-metrics create configmap kubeloupe-config \
+          #     --from-literal=STORAGE_DIR=/var/lib/kubeloupe/metrics \
+          #     --from-literal=STORAGE_RETENTION_DAYS=30
+          envFrom:
+            - configMapRef: { name: kubeloupe-config, optional: true }
           env:
-            # 30s against Lens' 60s display step leaves rate() two samples
-            # per point. 24h covers Lens' longest range.
-            - name: SCRAPE_INTERVAL_SECONDS
-              value: "30"
-            - name: RETENTION_HOURS
-              value: "24"
             # Unset would disable persistence. This path is the mounted
             # volume below.
             - name: SNAPSHOT_PATH
               value: /var/lib/kubeloupe/snapshot.bin
-            # The upper bound on history lost to an UNCLEAN kill. A
-            # rollout or any other SIGTERM writes a final snapshot and
-            # costs nothing.
-            - name: SNAPSHOT_INTERVAL_SECONDS
-              value: "300"
             # Logs, off unless the Secret kubeloupe-logs exists, so a cluster
             # keeps its settings there and this file stays the same
             # everywhere. `targets` is LOG_TARGETS, such as
@@ -163,9 +165,9 @@ spec:
               memory: 48Mi
             # Sized for the store: ~400 series x 2880 samples x ~1.9 bytes
             # is about 2 MB, plus the runtime. Deliberately left with room
-            # to spare -- the request has not been lowered to match until
-            # the compressed build has a day of real measurement behind
-            # it. Raise the limit before raising RETENTION_HOURS.
+            # to spare. Raise the limit before raising RETENTION_HOURS;
+            # with STORAGE_DIR, memory holds only the current hour however
+            # long the retention is.
             limits:
               memory: 128Mi
           securityContext:

@@ -8,15 +8,21 @@
 //! answers the subset of PromQL Lens actually generates.
 //!
 //! Given `LOG_TARGETS`, it also keeps the named pods' logs on disk
-//! ([`logs`]); without it, none.
+//! ([`logs`]); without it, none. Given `SCRAPE_CONFIG`, it also reads
+//! Prometheus exporters ([`scrape`]); given `STORAGE_DIR`, it keeps
+//! history on disk for as long as `STORAGE_RETENTION_DAYS` says
+//! ([`disk`]) rather than a day in memory. Without them it is what it
+//! always was.
 
 mod api;
 mod chunk;
 mod collect;
 mod discovery;
+mod disk;
 mod kube;
 mod logs;
 mod promql;
+mod scrape;
 mod snapshot;
 mod store;
 
@@ -79,11 +85,55 @@ impl Config {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     let client = kube::Client::in_cluster()?;
+    let scrapes = scrape::from_env(config.scrape_interval as i64)?;
 
-    let store = restore(&config);
+    let disk = match disk::Config::from_env() {
+        Some(disk_config) => {
+            // Memory then holds only the hour not yet written, so its own
+            // retention must not drop anything before that happens; and
+            // the snapshot covering that hour has a natural home.
+            config.retention = disk_config.retention;
+            if config.snapshot_path.is_none() {
+                config.snapshot_path = Some(disk_config.dir.join("head.snapshot"));
+            }
+            Some(disk::Disk::open(disk_config)?)
+        }
+        None => None,
+    };
+    if let Some(disk) = &disk {
+        eprintln!(
+            "kubeloupe: metrics on disk in {}: {} days, {} MB, keeping {} days{}, up to {} MB",
+            disk.config.dir.display(),
+            disk.days(),
+            disk.bytes() >> 20,
+            disk.config.retention / 86_400,
+            match disk.config.downsample_after {
+                Some(after) => format!(
+                    ", every {}s after {} days",
+                    disk.config.resolution,
+                    after / 86_400
+                ),
+                None => String::new(),
+            },
+            disk.config.max_bytes >> 20,
+        );
+    }
+
+    let mut store = restore(&config);
+    store.disk = disk;
     let store: api::Shared = Arc::new(RwLock::new(store));
+
+    if let Some(plans) = scrapes {
+        let jobs: Vec<String> = plans.iter().map(scrape::Plan::describe).collect();
+        eprintln!("kubeloupe: scraping {}", jobs.join(", "));
+        tokio::spawn(scrape::run(
+            kube::Client::in_cluster()?,
+            plans,
+            Arc::clone(&store),
+        ));
+    }
 
     let collector = tokio::spawn(collector_loop(
         Arc::clone(&store),
@@ -148,7 +198,10 @@ async fn main() -> Result<()> {
     // Stopping the collector first means nothing is mid-write below.
     collector.abort();
     if let Some(path) = &config.snapshot_path {
-        let guard = store.read().await;
+        let mut guard = store.write().await;
+        if let Err(error) = guard.flush() {
+            eprintln!("kubeloupe: final flush to disk failed: {error:#}");
+        }
         match snapshot::save(&guard, path) {
             Ok(()) => eprintln!("kubeloupe: final snapshot written to {}", path.display()),
             Err(error) => eprintln!("kubeloupe: final snapshot failed: {error:#}"),
@@ -200,6 +253,7 @@ async fn collector_loop(
     let mut ticker = tokio::time::interval(Duration::from_secs(scrape_interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_snapshot = now();
+    let mut last_flush = now();
     let mut pods = None;
 
     loop {
@@ -230,8 +284,27 @@ async fn collector_loop(
             guard.prune(started);
         }
 
+        // With a disk tier, the hour's samples go to disk as each hour
+        // turns, and finished days are merged, downsampled or aged out.
+        // The snapshot is written straight after, so that a crash cannot
+        // replay an hour that is already on disk.
+        let mut flushed = false;
+        if started.div_euclid(3600) != last_flush.div_euclid(3600) {
+            let mut guard = store.write().await;
+            if guard.disk.is_some() {
+                match guard.flush() {
+                    Ok(()) => flushed = true,
+                    Err(error) => eprintln!("kubeloupe: writing metrics to disk failed: {error:#}"),
+                }
+                if let Some(disk) = guard.disk.as_mut() {
+                    disk.maintain(started);
+                }
+            }
+            last_flush = started;
+        }
+
         let Some(path) = &snapshot_path else { continue };
-        if started - last_snapshot < snapshot_interval {
+        if !flushed && started - last_snapshot < snapshot_interval {
             continue;
         }
         // Taken under a READ lock, after the write guard above is dropped,
