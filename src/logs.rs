@@ -77,10 +77,34 @@ impl Target {
 
 pub struct Config {
     pub targets: Vec<Target>,
-    pub token: String,
+    pub token: Token,
     pub interval: u64,
     pub max_bytes: u64,
     pub dir: PathBuf,
+}
+
+/// The bearer `/api/v1/logs` asks for: `LOG_TOKEN`, or `LOG_TOKEN_FILE` read on
+/// every request, so a Secret mounted as a file can be changed without a restart.
+pub enum Token {
+    Fixed(String),
+    File(PathBuf),
+}
+
+impl Token {
+    fn read(&self) -> String {
+        match self {
+            Token::Fixed(token) => token.clone(),
+            Token::File(path) => std::fs::read_to_string(path)
+                .map(|t| t.trim().to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Never for an empty token: a missing file must not open the logs to anyone.
+    fn allows(&self, given: &str) -> bool {
+        let want = self.read();
+        !want.is_empty() && same(given.as_bytes(), want.as_bytes())
+    }
 }
 
 impl Config {
@@ -90,14 +114,28 @@ impl Config {
         if spec.trim().is_empty() {
             return None;
         }
-        let token = std::env::var("LOG_TOKEN")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if token.is_empty() {
-            eprintln!("kubeloupe: LOG_TARGETS is set but LOG_TOKEN isn't; not collecting logs");
-            return None;
-        }
+        let file = std::env::var("LOG_TOKEN_FILE").unwrap_or_default();
+        let token = if !file.trim().is_empty() {
+            let token = Token::File(PathBuf::from(file.trim()));
+            if token.read().is_empty() {
+                eprintln!(
+                    "kubeloupe: LOG_TOKEN_FILE {file} is empty or unreadable; logs answer no one until it isn't"
+                );
+            }
+            token
+        } else {
+            let token = std::env::var("LOG_TOKEN")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if token.is_empty() {
+                eprintln!(
+                    "kubeloupe: LOG_TARGETS is set but neither LOG_TOKEN nor LOG_TOKEN_FILE; not collecting logs"
+                );
+                return None;
+            }
+            Token::Fixed(token)
+        };
         let dir = PathBuf::from(
             std::env::var("LOG_DIR").unwrap_or_else(|_| "/var/lib/kubeloupe/logs".to_string()),
         );
@@ -652,7 +690,7 @@ async fn serve(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if !same(given.as_bytes(), config.token.as_bytes()) {
+    if !config.token.allows(given) {
         return (
             StatusCode::UNAUTHORIZED,
             "a bearer token is needed for logs\n",
@@ -792,7 +830,7 @@ mod tests {
         }
         Config {
             targets,
-            token: "t".into(),
+            token: Token::Fixed("t".into()),
             interval: 15,
             max_bytes,
             dir: root.into(),
@@ -1030,5 +1068,20 @@ mod tests {
         assert!(!same(b"secret", b"secreT"));
         assert!(!same(b"secret", b"secret!"));
         assert!(!same(b"", b"secret"));
+    }
+
+    #[test]
+    fn a_token_file_is_read_on_every_request() {
+        let path = std::env::temp_dir().join(format!("kubeloupe-token-{}", std::process::id()));
+        let token = Token::File(path.clone());
+        assert!(!token.allows(""), "no file lets no one in");
+        std::fs::write(&path, "first\n").unwrap();
+        assert!(token.allows("first"));
+        std::fs::write(&path, "second").unwrap();
+        assert!(token.allows("second") && !token.allows("first"));
+        std::fs::write(&path, "  \n").unwrap();
+        assert!(!token.allows(""), "an empty file lets no one in");
+        std::fs::remove_file(&path).unwrap();
+        assert!(!Token::Fixed(String::new()).allows(""));
     }
 }

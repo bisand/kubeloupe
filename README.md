@@ -383,7 +383,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 Logs say more than metrics do, and anything on the cluster can reach the
 Service, so `/api/v1/logs` asks for `LOG_TOKEN` as a bearer, and logs stay
-off without one. The manifest reads both from an optional Secret:
+off without one. The manifest reads both from an optional Secret, the token
+as a file on every request, so changing it needs no restart:
 
 ```
 kubectl -n lens-metrics create secret generic kubeloupe-logs \
@@ -586,7 +587,8 @@ the manifest says later.
 | `POD_REFRESH_INTERVAL_SECONDS` | `300` | The pod list is the largest read and the slowest-changing, so it has its own cadence. A container it cannot name shortens the wait to one scrape. |
 | `LISTEN_ADDR` | `0.0.0.0:9090` | |
 | `LOG_TARGETS` | *(unset)* | What to keep logs of, and for how long. Unset, no logs are read. See [Logs](#logs-for-the-pods-you-name). |
-| `LOG_TOKEN` | *(unset)* | The bearer `/api/v1/logs` asks for. Required for logs. |
+| `LOG_TOKEN` | *(unset)* | The bearer `/api/v1/logs` asks for. Required for logs, unless `LOG_TOKEN_FILE`. |
+| `LOG_TOKEN_FILE` | *(unset)* | The bearer in a file, read on every request: a Secret mounted as a volume can be changed without a restart. Wins over `LOG_TOKEN`. The supplied manifest uses it. |
 | `LOG_DIR` | `/var/lib/kubeloupe/logs` | On the snapshot volume in the supplied manifest. |
 | `LOG_MAX_MB` | `32` | All targets' files together. Size the volume to match. |
 | `LOG_INTERVAL_SECONDS` | `15` | How often the pods are listed: how soon a new container's log is followed. Lines themselves arrive as they are written. |

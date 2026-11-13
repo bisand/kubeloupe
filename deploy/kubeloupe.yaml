@@ -124,7 +124,9 @@ spec:
             # `meet/meet-=30d,meet/db-=7d` (namespace[/pod-prefix][=retention]);
             # `token` the bearer /api/v1/logs asks for; `max-mb` (optional,
             # 32) the most all of them may take on the volume below -- size
-            # the volume to match. Change any of them and restart the pod.
+            # the volume to match. Change `targets` or `max-mb` and restart
+            # the pod; the token is a file read on every request, so a new
+            # one takes effect within a minute, without a restart.
             # See the README's Logs section.
             #   kubectl -n lens-metrics create secret generic kubeloupe-logs \
             #     --from-literal=targets=meet/meet-=30d \
@@ -133,9 +135,8 @@ spec:
             - name: LOG_TARGETS
               valueFrom:
                 secretKeyRef: { name: kubeloupe-logs, key: targets, optional: true }
-            - name: LOG_TOKEN
-              valueFrom:
-                secretKeyRef: { name: kubeloupe-logs, key: token, optional: true }
+            - name: LOG_TOKEN_FILE
+              value: /var/run/kubeloupe-logs/token
             - name: LOG_MAX_MB
               valueFrom:
                 secretKeyRef: { name: kubeloupe-logs, key: max-mb, optional: true }
@@ -159,6 +160,10 @@ spec:
             # writable, so persistence costs none of the hardening.
             - name: snapshot
               mountPath: /var/lib/kubeloupe
+            # Not subPath: only a whole-volume mount follows the Secret.
+            - name: logs-token
+              mountPath: /var/run/kubeloupe-logs
+              readOnly: true
           resources:
             requests:
               cpu: 20m
@@ -179,6 +184,11 @@ spec:
         - name: snapshot
           persistentVolumeClaim:
             claimName: kubeloupe
+        - name: logs-token
+          secret:
+            secretName: kubeloupe-logs
+            items: [{ key: token, path: token }]
+            optional: true
 ---
 # The name and namespace are chosen so Lens needs no configuration: its
 # built-in provider does a literal lookup of the Service `prometheus` in
