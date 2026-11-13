@@ -383,22 +383,26 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 Logs say more than metrics do, and anything on the cluster can reach the
 Service, so `/api/v1/logs` asks for `LOG_TOKEN` as a bearer, and logs stay
-off without one. The manifest reads both from an optional Secret, the token
-as a file on every request, so changing it needs no restart:
+off without one. The manifest reads the token from the optional Secret
+`kubeloupe-logs`, as a file on every request, so changing it needs no
+restart. `LOG_TARGETS` and `LOG_MAX_MB` are settings like any other, in
+[`kubeloupe-config`](#configuration):
 
 ```
 kubectl -n lens-metrics create secret generic kubeloupe-logs \
-  --from-literal=targets=meet/meet-=30d,meet/glugg-db-=7d \
-  --from-literal=token=$(openssl rand -hex 24) \
-  --from-literal=max-mb=128
+  --from-literal=token=$(openssl rand -hex 24)
+kubectl -n lens-metrics create configmap kubeloupe-config \
+  --from-literal=LOG_TARGETS=meet/meet-=30d,meet/glugg-db-=7d \
+  --from-literal=LOG_MAX_MB=128
 kubectl -n lens-metrics rollout restart deploy/kubeloupe
 ```
 
-Retention and the cap are settings, not code: change the Secret and restart
-the pod. Lowering a retention deletes the days past it on the next poll;
-raising one keeps what is on disk and lets it grow. Size the volume for
-`max-mb` plus the metrics snapshot: the supplied claim is 64Mi, enough for
-the default 32. (k3s' local-path doesn't enforce a claim's size, so there
+Retention and the cap are settings, not code: change them and restart the
+pod, or keep them in [`deploy/with-settings`](deploy/with-settings), where a
+change restarts it by itself. Lowering a retention deletes the days past it
+on the next poll; raising one keeps what is on disk and lets it grow. Size
+the volume for `LOG_MAX_MB` plus the metrics snapshot: the supplied claim is
+64Mi, enough for the default 32. (k3s' local-path doesn't enforce a claim's size, so there
 the cap is what keeps the disk in check.)
 
 To size it, a target needs about its pods' daily log volume times its days:
@@ -502,6 +506,10 @@ A day of history stays on whichever PVC you delete. The file's magic still
 reads `LMD1` and the loader still reads every version it has ever written,
 so copy `snapshot.bin` across first if it is worth the trouble; otherwise
 the new pod refills within the hour.
+
+Up to `0.4.3`, the Secret `kubeloupe-logs` also held `targets`
+and `max-mb`. The manifest now reads only its token, so logs stop until those are
+`LOG_TARGETS` and `LOG_MAX_MB` in `kubeloupe-config`.
 
 ## Persistence
 

@@ -13,7 +13,7 @@ metadata:
 # and limits, and nodes/proxy reaches each kubelet's /stats/summary
 # through the API server rather than opening a second TLS path to
 # port 10250. pods/log is read only for the targets in LOG_TARGETS, and
-# only when that is set (below).
+# only when that is set (in kubeloupe-config, below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -110,7 +110,8 @@ spec:
           # stays the same everywhere. See the README's Configuration.
           #   kubectl -n lens-metrics create configmap kubeloupe-config \
           #     --from-literal=STORAGE_DIR=/var/lib/kubeloupe/metrics \
-          #     --from-literal=STORAGE_RETENTION_DAYS=30
+          #     --from-literal=STORAGE_RETENTION_DAYS=30 \
+          #     --from-literal=LOG_TARGETS=meet/meet-=30d
           # It is read only at start, so restart the pod after a change --
           # or keep the settings in files with deploy/with-settings, where
           # kustomize names the ConfigMap after a hash of its contents and
@@ -122,28 +123,16 @@ spec:
             # volume below.
             - name: SNAPSHOT_PATH
               value: /var/lib/kubeloupe/snapshot.bin
-            # Logs, off unless the Secret kubeloupe-logs exists, so a cluster
-            # keeps its settings there and this file stays the same
-            # everywhere. `targets` is LOG_TARGETS, such as
-            # `meet/meet-=30d,meet/db-=7d` (namespace[/pod-prefix][=retention]);
-            # `token` the bearer /api/v1/logs asks for; `max-mb` (optional,
-            # 32) the most all of them may take on the volume below -- size
-            # the volume to match. Change `targets` or `max-mb` and restart
-            # the pod; the token is a file read on every request, so a new
-            # one takes effect within a minute, without a restart.
+            # The bearer /api/v1/logs asks for, from the optional Secret
+            # kubeloupe-logs: a file read on every request, so a new token
+            # takes effect within a minute, without a restart. Logs stay off
+            # without one. What to keep logs of (LOG_TARGETS) and the cap
+            # (LOG_MAX_MB) are settings like any other, in kubeloupe-config.
             # See the README's Logs section.
             #   kubectl -n lens-metrics create secret generic kubeloupe-logs \
-            #     --from-literal=targets=meet/meet-=30d \
-            #     --from-literal=token=$(openssl rand -hex 24) \
-            #     --from-literal=max-mb=32
-            - name: LOG_TARGETS
-              valueFrom:
-                secretKeyRef: { name: kubeloupe-logs, key: targets, optional: true }
+            #     --from-literal=token=$(openssl rand -hex 24)
             - name: LOG_TOKEN_FILE
               value: /var/run/kubeloupe-logs/token
-            - name: LOG_MAX_MB
-              valueFrom:
-                secretKeyRef: { name: kubeloupe-logs, key: max-mb, optional: true }
           ports:
             - name: http
               containerPort: 9090
