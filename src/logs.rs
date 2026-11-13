@@ -3,12 +3,15 @@
 //!
 //! The kubelet keeps a container's log only while its pod exists, so a
 //! rollout, an eviction or a deleted pod takes the lines with it -- often
-//! the very lines someone wants to read afterwards. This polls each
-//! container's log through the API server (`pods/log`) every
-//! `LOG_INTERVAL_SECONDS` and appends what is new to a file per target per
-//! day. A container that restarted since the last poll has its previous
-//! run read too, so a crash's last lines stay. What is still lost: what a
-//! pod writes in its last poll interval before it is deleted.
+//! the very lines someone wants to read afterwards. This follows each
+//! container's log through the API server (`pods/log?follow=true`) and
+//! appends lines to a file per target per day as they are written, up to
+//! the moment the container stops -- a pod that exits a second after it is
+//! told to still has its last words kept. Every `LOG_INTERVAL_SECONDS` the
+//! pods are listed, new containers get a stream, and one that ended (or has
+//! run ten minutes, so a silently dead connection can't hide lines) is
+//! started again from where it got to. A container that restarted has its
+//! previous run read too.
 //!
 //! A target is `namespace[/pod-prefix][=retention]`, such as
 //! `meet/meet-=14d`: only pods it names are read, and its files are deleted
@@ -31,7 +34,7 @@
 //! than JSON: it is read by people and pasted into language models, and
 //! both do better with lines.
 
-use crate::kube::{Client, ContainerStatus};
+use crate::kube::Client;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::extract::{Query, State};
@@ -46,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// One read's ceiling. The kubelet returns the oldest bytes first, so a
-/// long backlog is caught up over several polls instead of in one spike.
+/// long backlog is caught up over several reads instead of in one spike.
 pub const FETCH_LIMIT: usize = 1 << 20;
 const MAX_QUERY_LINES: usize = 50_000;
 const DAY: i64 = 86_400;
@@ -191,8 +194,10 @@ struct Key {
 #[derive(Default)]
 struct Cursor {
     last: i64,
-    /// The restart count at the last poll; None until polled.
+    /// The restart count when its stream last started; None until then.
     restarts: Option<u32>,
+    /// A stream is reading it now.
+    following: bool,
 }
 
 /// The kubelet's `timestamps=true` output, `<RFC 3339> <text>` per line, as
@@ -379,12 +384,17 @@ fn newest_only(hits: &mut Vec<(i64, String)>, limit: usize) {
     hits.drain(..skip);
 }
 
+type Cursors = Arc<std::sync::Mutex<HashMap<Key, Cursor>>>;
+
 pub async fn run(client: Client, config: Arc<Config>) {
+    let client = Arc::new(client);
     let mut ticker = tokio::time::interval(Duration::from_secs(config.interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let floors: Vec<Option<i64>> = config.targets.iter().map(newest).collect();
-    let mut cursors: HashMap<Key, Cursor> = HashMap::new();
-    // Said once per new error, not once per poll.
+    let cursors: Cursors = Arc::default();
+    // The newest error a stream ended with, said with the loop's own.
+    let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    // Said once per new error, not once per pass.
     let mut said = String::new();
     loop {
         ticker.tick().await;
@@ -424,30 +434,46 @@ pub async fn run(client: Client, config: Arc<Config>) {
                         pod: name.clone(),
                         container: status.name.clone(),
                     };
-                    let cursor = cursors.entry(key.clone()).or_insert_with(|| Cursor {
-                        last: floors[at].unwrap_or(i64::MIN),
-                        restarts: None,
-                    });
-                    if let Err(e) = poll(
-                        &client,
-                        &config.targets[at],
-                        &key,
-                        &pod.spec.node_name,
-                        status,
-                        cursor,
-                    )
-                    .await
-                    {
-                        error.get_or_insert(format!("{e:#}"));
+                    seen.push(key.clone());
+                    // One stream per container: start one unless it has one.
+                    let start = {
+                        let mut held = cursors.lock().unwrap();
+                        let cursor = held.entry(key.clone()).or_insert_with(|| Cursor {
+                            last: floors[at].unwrap_or(i64::MIN),
+                            ..Cursor::default()
+                        });
+                        !std::mem::replace(&mut cursor.following, true)
+                    };
+                    if start {
+                        let node = if pod.spec.node_name.is_empty() {
+                            "-".to_string()
+                        } else {
+                            pod.spec.node_name.clone()
+                        };
+                        tokio::spawn(follow(
+                            Arc::clone(&client),
+                            Arc::clone(&config),
+                            at,
+                            key,
+                            node,
+                            status.restart_count,
+                            Arc::clone(&cursors),
+                            Arc::clone(&failed),
+                        ));
                     }
-                    seen.push(key);
                 }
             }
         }
-        // A pod that is gone has nothing more to read. (A failed listing
-        // above leaves its namespace's cursors alone.)
+        // A pod that is gone has nothing more to read once its stream has
+        // ended. (A failed listing leaves its namespace's cursors alone.)
         if error.is_none() {
-            cursors.retain(|key, _| seen.contains(key));
+            cursors
+                .lock()
+                .unwrap()
+                .retain(|key, c| c.following || seen.contains(key));
+        }
+        if let Some(e) = failed.lock().unwrap().take() {
+            error.get_or_insert(e);
         }
         match error {
             Some(e) if e != said => {
@@ -461,24 +487,61 @@ pub async fn run(client: Client, config: Arc<Config>) {
     }
 }
 
-async fn poll(
+/// Follows one container's log until it stops, the connection does, or ten
+/// minutes pass, then hands the container back to the loop, which starts
+/// again from where this got to if the container is still there.
+#[allow(clippy::too_many_arguments)]
+async fn follow(
+    client: Arc<Client>,
+    config: Arc<Config>,
+    at: usize,
+    key: Key,
+    node: String,
+    restart_count: u32,
+    cursors: Cursors,
+    failed: Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let result = follow_once(
+        &client,
+        &config.targets[at],
+        &key,
+        &node,
+        restart_count,
+        &cursors,
+    )
+    .await;
+    if let Some(cursor) = cursors.lock().unwrap().get_mut(&key) {
+        cursor.following = false;
+    }
+    if let Err(e) = result {
+        *failed.lock().unwrap() = Some(format!("{e:#}"));
+    }
+}
+
+async fn follow_once(
     client: &Client,
     target: &Target,
     key: &Key,
     node: &str,
-    status: &ContainerStatus,
-    cursor: &mut Cursor,
+    restart_count: u32,
+    cursors: &Cursors,
 ) -> Result<()> {
+    let (mut last, restarts) = {
+        let held = cursors.lock().unwrap();
+        held.get(key)
+            .map_or((i64::MIN, None), |c| (c.last, c.restarts))
+    };
+    let save = |last: i64| {
+        if let Some(cursor) = cursors.lock().unwrap().get_mut(key) {
+            cursor.last = last;
+        }
+    };
     // sinceTime has whole seconds; lines repeated within that second are
-    // no newer than the last and are dropped below.
-    let since = (cursor.last > i64::MIN).then(|| cursor.last.div_euclid(NANOS));
-    let mut bodies = Vec::new();
-    if cursor
-        .restarts
-        .is_some_and(|seen| status.restart_count > seen)
-        && since.is_some()
-    {
-        // The previous run may be gone already; its loss is not an error.
+    // no newer than the last and are dropped by keep().
+    let since = (last > i64::MIN).then(|| last.div_euclid(NANOS));
+    if restarts.is_some_and(|seen| restart_count > seen) && since.is_some() {
+        // What the run before the restart wrote after this last read it.
+        // It may be gone already; its loss is not an error.
         if let Ok(body) = client
             .container_log(
                 &key.namespace,
@@ -490,46 +553,86 @@ async fn poll(
             )
             .await
         {
-            bodies.push(body);
+            keep(target, key, node, &body, &mut last)?;
+            save(last);
         }
     }
-    match client
-        .container_log(
+    if let Some(cursor) = cursors.lock().unwrap().get_mut(key) {
+        cursor.restarts = Some(restart_count);
+    }
+    let since = (last > i64::MIN).then(|| last.div_euclid(NANOS));
+    let mut response = match client
+        .follow_log(
             &key.namespace,
             &key.pod,
             &key.container,
             since,
             target.retention,
-            false,
         )
         .await
     {
-        Ok(body) => bodies.push(body),
+        Ok(response) => response,
         // A container still waiting to start has no log yet: 400, and nothing wrong.
-        Err(e) if e.to_string().contains("400 Bad Request") => {}
+        Err(e) if e.to_string().contains("400 Bad Request") => return Ok(()),
         Err(e) => return Err(e),
-    }
-    let node = if node.is_empty() { "-" } else { node };
-    let mut lines = Vec::new();
-    for body in &bodies {
-        for (t, text) in parse_body(body) {
-            if t > cursor.last {
-                cursor.last = t;
-                lines.push((
-                    t,
-                    format!(
-                        "{} {node} {}/{} {text}",
-                        rfc3339(t, 9),
-                        key.pod,
-                        key.container
-                    ),
-                ));
+    };
+    let mut pending: Vec<u8> = Vec::new();
+    // Ten minutes at most: a connection that died without a word can't
+    // hold a container's lines for longer than that.
+    let streamed = tokio::time::timeout(Duration::from_secs(600), async {
+        while let Some(chunk) = response.chunk().await? {
+            pending.extend_from_slice(&chunk);
+            if let Some(end) = pending.iter().rposition(|b| *b == b'\n') {
+                let whole: Vec<u8> = pending.drain(..=end).collect();
+                keep(
+                    target,
+                    key,
+                    node,
+                    &String::from_utf8_lossy(&whole),
+                    &mut last,
+                )?;
+                save(last);
             }
         }
+        // The container stopped: whatever it wrote last, even without a newline.
+        if !pending.is_empty() {
+            pending.push(b'\n');
+            keep(
+                target,
+                key,
+                node,
+                &String::from_utf8_lossy(&pending),
+                &mut last,
+            )?;
+            save(last);
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    match streamed {
+        Ok(result) => result,
+        Err(_) => Ok(()),
     }
-    append(target, &lines)?;
-    cursor.restarts = Some(status.restart_count);
-    Ok(())
+}
+
+/// Appends the lines of `body` newer than `last`, and moves `last` on.
+fn keep(target: &Target, key: &Key, node: &str, body: &str, last: &mut i64) -> Result<()> {
+    let mut lines = Vec::new();
+    for (t, text) in parse_body(body) {
+        if t > *last {
+            *last = t;
+            lines.push((
+                t,
+                format!(
+                    "{} {node} {}/{} {text}",
+                    rfc3339(t, 9),
+                    key.pod,
+                    key.container
+                ),
+            ));
+        }
+    }
+    append(target, &lines)
 }
 
 pub fn router(config: Arc<Config>) -> Router {

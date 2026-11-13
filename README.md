@@ -325,9 +325,9 @@ memory a different way gets a wrong number, not a missing one.
 
 Off unless asked for, and then only for what is named. The kubelet keeps a
 container's log only while its pod exists, so a rollout or an eviction takes
-the lines with it. Given `LOG_TARGETS`, kubeloupe reads those pods' logs
-through the API server (`pods/log`) every `LOG_INTERVAL_SECONDS` and appends
-them to plain text files, one per target per day:
+the lines with it. Given `LOG_TARGETS`, kubeloupe follows those pods' logs
+through the API server (`pods/log?follow=true`) and appends each line, as it
+is written, to plain text files, one per target per day:
 
 ```
 LOG_TARGETS=meet/meet-=14d,meet/glugg-db-=3d,kube-system
@@ -338,9 +338,13 @@ A target is `namespace[/pod-prefix][=retention]` (`90m`, `24h`, `7d`; 24h if
 unset), and a pod belongs to the first target that names it. Pods that no
 target names are never read. Each target's days are deleted once they are
 older than its retention, and `LOG_MAX_MB` caps all of them together,
-oldest day first (never today's). A container that restarted between polls
-has its previous run read too, so a crash's last lines are kept. What is
-lost: anything a pod writes in its last poll interval before it is deleted.
+oldest day first (never today's). Because each container's log is followed
+rather than polled, a pod's last lines are kept even when it exits a moment
+after being told to stop, and a container that restarted has its previous
+run read too. Every `LOG_INTERVAL_SECONDS` the pods are listed again: new
+containers get a stream, and an ended one is picked up from where it got to.
+Each stream is one connection through the API server, reopened every ten
+minutes so a silently dead one can't hide lines.
 
 The process holds only where it got to in each container's log, so
 retention costs disk, not memory. After a restart it carries on from the
@@ -512,7 +516,7 @@ the manifest says later.
 | `LOG_TOKEN` | *(unset)* | The bearer `/api/v1/logs` asks for. Required for logs. |
 | `LOG_DIR` | `/var/lib/kubeloupe/logs` | On the snapshot volume in the supplied manifest. |
 | `LOG_MAX_MB` | `32` | All targets' files together. Size the volume to match. |
-| `LOG_INTERVAL_SECONDS` | `15` | Also the most a deleted pod's last lines can be missed by. |
+| `LOG_INTERVAL_SECONDS` | `15` | How often the pods are listed: how soon a new container's log is followed. Lines themselves arrive as they are written. |
 
 RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy` and `pods/log`.
 

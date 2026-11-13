@@ -15,6 +15,10 @@ const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
 pub struct Client {
     http: reqwest::Client,
+    /// For logs followed as they are written: no overall timeout, since a
+    /// quiet container's stream rightly stays open for hours, and TCP
+    /// keepalives so a dead connection is noticed anyway.
+    follow: reqwest::Client,
     base: String,
     token_path: String,
 }
@@ -40,13 +44,19 @@ impl Client {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent("kubeloupe");
+        let mut follow = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .tcp_keepalive(Duration::from_secs(30))
+            .user_agent("kubeloupe");
 
         for cert in reqwest::Certificate::from_pem_bundle(&ca)? {
-            builder = builder.add_root_certificate(cert);
+            builder = builder.add_root_certificate(cert.clone());
+            follow = follow.add_root_certificate(cert);
         }
 
         Ok(Self {
             http: builder.build()?,
+            follow: follow.build()?,
             base,
             token_path: format!("{SA_DIR}/token"),
         })
@@ -131,6 +141,39 @@ impl Client {
             anyhow::bail!("GET {path} returned {status}: {}", body.trim());
         }
         Ok(body)
+    }
+
+    /// A container's log as it is written, from `since` (unix seconds) or
+    /// the last `backlog` seconds, until the container stops or the
+    /// connection does. Read it with `chunk()`.
+    pub async fn follow_log(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        since: Option<i64>,
+        backlog: i64,
+    ) -> Result<reqwest::Response> {
+        let from = match since {
+            Some(t) => format!("sinceTime={}", crate::logs::rfc3339(t * 1_000_000_000, 0)),
+            None => format!("sinceSeconds={backlog}"),
+        };
+        let path = format!(
+            "/api/v1/namespaces/{namespace}/pods/{pod}/log?container={container}&timestamps=true&follow=true&{from}"
+        );
+        let response = self
+            .follow
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(self.token()?)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GET {path} returned {status}: {}", body.trim());
+        }
+        Ok(response)
     }
 
     pub async fn node_stats(&self, node: &str) -> Result<StatsSummary> {
