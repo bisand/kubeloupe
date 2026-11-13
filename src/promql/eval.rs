@@ -34,7 +34,7 @@ impl Value {
 /// PromQL drops it from anything a function or operator touches, and
 /// matching two vectors line by line depends on it being gone.
 pub struct Fetched {
-    series: Vec<Vec<(Labels, Vec<Sample>)>>,
+    series: Vec<Vec<Found>>,
     /// How far back an instant looks.
     lookback: i64,
     /// The step of a range query, 0 for an instant one. A window narrower
@@ -42,6 +42,23 @@ pub struct Fetched {
     /// `rate(x[1m])` over a month averages each step rather than sampling
     /// one minute of it.
     step: i64,
+}
+
+struct Found {
+    labels: Labels,
+    samples: Vec<Sample>,
+    /// For range functions: the counter-aware increase from the first
+    /// sample to each one, so any window's increase is one subtraction --
+    /// `increase(x[30d])` charted at a thousand steps would otherwise sum
+    /// a month of samples a thousand times.
+    climb: Vec<f64>,
+}
+
+impl Found {
+    /// The counter-aware increase across `samples[from..end]`.
+    fn delta(&self, from: usize, end: usize) -> f64 {
+        self.climb[end - 1] - self.climb[from]
+    }
 }
 
 /// Reads what `expr` needs to be evaluated anywhere in `[start, end]`.
@@ -62,10 +79,23 @@ pub fn fetch(store: &Store, expr: &Expr, start: i64, end: i64, step: i64) -> Fet
 
     for (selector, window) in wanted {
         let reach = window.map_or(0, |w| fetched.window(w)) + fetched.lookback;
-        let mut found = store.fetch(selector, start - reach, end);
-        for (labels, _) in &mut found {
-            labels.remove(NAME_LABEL);
-        }
+        let found: Vec<Found> = store
+            .fetch(selector, start - reach, end)
+            .into_iter()
+            .map(|(mut labels, samples)| {
+                labels.remove(NAME_LABEL);
+                let climb = if window.is_some() {
+                    climb(&samples)
+                } else {
+                    Vec::new()
+                };
+                Found {
+                    labels,
+                    samples,
+                    climb,
+                }
+            })
+            .collect();
         if fetched.series.len() <= selector.id {
             fetched.series.resize_with(selector.id + 1, Vec::new);
         }
@@ -98,7 +128,7 @@ impl Fetched {
         window.max(self.step)
     }
 
-    fn of(&self, selector: &Selector) -> &[(Labels, Vec<Sample>)] {
+    fn of(&self, selector: &Selector) -> &[Found] {
         self.series
             .get(selector.id)
             .map(Vec::as_slice)
@@ -119,10 +149,11 @@ pub fn eval_at(data: &Fetched, expr: &Expr, t: i64) -> Value {
 
         Expr::Selector(selector) => {
             let mut out = Vec::new();
-            for (labels, samples) in data.of(selector) {
+            for found in data.of(selector) {
+                let samples = &found.samples;
                 let idx = samples.partition_point(|s| s.t <= t);
                 if idx > 0 && t - samples[idx - 1].t <= data.lookback {
-                    out.push((labels.clone(), samples[idx - 1].v));
+                    out.push((found.labels.clone(), samples[idx - 1].v));
                 }
             }
             Value::Vector(out)
@@ -135,12 +166,18 @@ pub fn eval_at(data: &Fetched, expr: &Expr, t: i64) -> Value {
         } => {
             let window = data.window(*window);
             let mut out = Vec::new();
-            for (labels, samples) in data.of(selector) {
+            for found in data.of(selector) {
+                let samples = &found.samples;
                 let begin = samples.partition_point(|s| s.t <= t - window);
                 let end = samples.partition_point(|s| s.t <= t);
+                let rate = |from: usize| {
+                    let span = samples[end - 1].t - samples[from].t;
+                    (end >= from + 2 && span > 0).then(|| found.delta(from, end) / span as f64)
+                };
                 let value = match func {
-                    RangeFn::Rate => rate(&samples[begin..end]),
-                    RangeFn::Irate => rate(&samples[begin.max(end.saturating_sub(2))..end]),
+                    _ if end == 0 => None,
+                    RangeFn::Rate => rate(begin),
+                    RangeFn::Irate => rate(begin.max(end.saturating_sub(2))),
                     // VictoriaMetrics' increase: from the last sample before
                     // the window, when there is a recent one, so consecutive
                     // windows add up to the whole and nothing falls between.
@@ -151,12 +188,11 @@ pub fn eval_at(data: &Fetched, expr: &Expr, t: i64) -> Value {
                             } else {
                                 begin
                             };
-                        let part = &samples[from..end];
-                        (part.len() >= 2).then(|| delta(part))
+                        (end >= from + 2).then(|| found.delta(from, end))
                     }
                 };
                 if let Some(value) = value {
-                    out.push((labels.clone(), value));
+                    out.push((found.labels.clone(), value));
                 }
             }
             Value::Vector(out)
@@ -331,28 +367,23 @@ fn compare(op: BinOp, a: f64, b: f64) -> Option<bool> {
     })
 }
 
-/// Counter-aware delta: a container restart resets its CPU counter, and a
-/// plain last-minus-first would render that as a large negative rate.
-fn delta(samples: &[Sample]) -> f64 {
-    let mut delta = 0.0;
-    let mut prev = samples[0].v;
-    for sample in &samples[1..] {
-        delta += if sample.v < prev {
+/// Running counter-aware increase. A reset -- a container restart zeroes
+/// its CPU counter -- counts the new value from zero, where a plain
+/// last-minus-first would render it as a large negative rate.
+fn climb(samples: &[Sample]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(samples.len());
+    let mut total = 0.0;
+    let mut prev = samples.first().map_or(0.0, |s| s.v);
+    for sample in samples {
+        total += if sample.v < prev {
             sample.v
         } else {
             sample.v - prev
         };
         prev = sample.v;
+        out.push(total);
     }
-    delta
-}
-
-fn rate(samples: &[Sample]) -> Option<f64> {
-    if samples.len() < 2 {
-        return None;
-    }
-    let span = samples[samples.len() - 1].t - samples[0].t;
-    (span > 0).then(|| delta(samples) / span as f64)
+    out
 }
 
 /// The series a selector matches in memory, for the discovery endpoints.

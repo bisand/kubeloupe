@@ -1672,3 +1672,42 @@ fn a_range_widens_a_narrow_window_to_its_step() {
         );
     }
 }
+
+#[test]
+fn a_month_long_increase_charted_at_many_steps_is_exact_and_cheap() {
+    // The "outgoing traffic, last 30 days" bar: increase(x[30d]) evaluated
+    // at every step of a six-hour chart, over a month of 10 s samples.
+    let mut store = Store::new(40 * 86_400);
+    let start = 1_700_000_000;
+    let end = start + 31 * 86_400;
+    for box_ in ["a", "b"] {
+        let mut v = 0.0;
+        for t in (start..=end).step_by(10) {
+            v += 1_000.0;
+            store.append(
+                labels(
+                    "node_network_transmit_bytes_total",
+                    &[("instance", box_), ("device", "eth0")],
+                ),
+                t,
+                v,
+            );
+        }
+    }
+    let expr = parser::parse(r#"increase(node_network_transmit_bytes_total{device="eth0"}[30d])"#)
+        .unwrap();
+    let began = std::time::Instant::now();
+    let series = eval::query_range(&store, &expr, end - 6 * 3_600, end, 20);
+    let took = began.elapsed();
+    assert_eq!(series.len(), 2);
+    for s in &series {
+        assert_eq!(s.values.len(), 1_081);
+        // 30 days of 1000 bytes every 10 s.
+        assert!(
+            s.values.iter().all(|(_, v)| *v == 30.0 * 8_640.0 * 1_000.0),
+            "{:?}",
+            &s.values[..3]
+        );
+    }
+    assert!(took.as_secs() < 5, "took {took:?}");
+}
