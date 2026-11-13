@@ -159,8 +159,13 @@ async fn instant(store: Shared, params: Params) -> Response {
     success("vector", result)
 }
 
+/// Seconds, kept to 0..=year 5138 so the window arithmetic downstream can
+/// never overflow, whatever a client sends.
 fn parse_time(text: &str) -> Option<i64> {
-    text.parse::<f64>().ok().map(|seconds| seconds as i64)
+    text.parse::<f64>()
+        .ok()
+        .filter(|s| s.is_finite())
+        .map(|seconds| (seconds as i64).clamp(0, 100_000_000_000))
 }
 
 /// Prometheus renders sample values as strings, and Lens parses them back

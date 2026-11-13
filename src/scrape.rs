@@ -150,16 +150,26 @@ async fn run_job(client: Arc<kube::Client>, plan: Plan, store: Shared) {
     let mut ticker = tokio::time::interval(Duration::from_secs(plan.every as u64));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut targets: Vec<Target> = Vec::new();
-    let mut listed = i64::MIN;
+    let mut listed: Option<i64> = None;
+    // Which targets answered last time, so a change is logged once.
+    let mut answering: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     loop {
         ticker.tick().await;
         let now = crate::now();
-        if now - listed >= DISCOVER_EVERY {
+        if listed.is_none_or(|at| now - at >= DISCOVER_EVERY) {
             match discover(&client, &plan.job).await {
                 Ok(found) => {
+                    if listed.is_none() || found.len() != targets.len() {
+                        eprintln!(
+                            "kubeloupe: scrape job {}: {} targets",
+                            plan.job.job,
+                            found.len()
+                        );
+                    }
+                    answering.retain(|url, _| found.iter().any(|t| &t.url == url));
                     targets = found;
-                    listed = now;
+                    listed = Some(now);
                 }
                 Err(error) => eprintln!("kubeloupe: scrape job {}: {error:#}", plan.job.job),
             }
@@ -178,9 +188,17 @@ async fn run_job(client: Arc<kube::Client>, plan: Plan, store: Shared) {
             let up = match body {
                 Ok(body) => {
                     keep(&plan, &target, &body, &mut batch);
+                    if answering.insert(target.url.clone(), true) == Some(false) {
+                        eprintln!("kubeloupe: {} answers again", target.url);
+                    }
                     1.0
                 }
-                Err(_) => 0.0,
+                Err(error) => {
+                    if answering.insert(target.url.clone(), false) != Some(false) {
+                        eprintln!("kubeloupe: {} did not answer: {error:#}", target.url);
+                    }
+                    0.0
+                }
             };
             batch.push((target_labels("up", &plan.job.job, &target.instance), up));
         }
@@ -410,6 +428,43 @@ mod tests {
         assert_eq!(out[0].0.get("instance").map(String::as_str), Some("box-1"));
         assert_eq!(out[0].0.get("job").map(String::as_str), Some("node"));
         assert_eq!(plans[0].every, 30);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_loop_scrapes_what_answers_and_marks_what_does_not() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(|| async { "glugg_rooms 2\nother 1\n" }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let config = format!(
+            r#"[{{"job":"glugg","every":"1s","url":"http://127.0.0.1:{port}/metrics","keep":"glugg_.*"}},
+                {{"job":"gone","every":"1s","url":"http://127.0.0.1:1/metrics"}}]"#
+        );
+        let store: Shared = Arc::new(tokio::sync::RwLock::new(crate::store::Store::new(3_600)));
+        run(
+            kube::Client::unreachable(),
+            parse_config(&config, 30).unwrap(),
+            store.clone(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        let store = store.read().await;
+        let value = |query: &str| {
+            let expr = crate::promql::parser::parse(query).unwrap();
+            match crate::promql::eval::eval(&store, &expr, crate::now()) {
+                crate::promql::eval::Value::Vector(v) => v.iter().map(|(_, v)| *v).sum::<f64>(),
+                _ => f64::NAN,
+            }
+        };
+        assert_eq!(value(r#"glugg_rooms{job="glugg"}"#), 2.0);
+        assert_eq!(value(r#"up{job="glugg"}"#), 1.0);
+        assert_eq!(value(r#"count(up{job="gone"} == 0)"#), 1.0);
+        assert_eq!(value("count(other)"), 0.0, "not kept");
     }
 
     #[test]

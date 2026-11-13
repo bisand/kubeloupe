@@ -62,6 +62,17 @@ impl Client {
         })
     }
 
+    /// A client for tests that never reaches an API server.
+    #[cfg(test)]
+    pub fn unreachable() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            follow: reqwest::Client::new(),
+            base: "http://127.0.0.1:1".to_string(),
+            token_path: "/nonexistent".to_string(),
+        }
+    }
+
     /// Read on every call rather than cached: projected ServiceAccount
     /// tokens expire and are rewritten in place, and a daemon that caches
     /// one starts returning 401 an hour after it starts.
