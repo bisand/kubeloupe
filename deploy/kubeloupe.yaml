@@ -12,7 +12,8 @@ metadata:
 # Read-only, and narrow: Node and Pod objects supply capacity, requests
 # and limits, and nodes/proxy reaches each kubelet's /stats/summary
 # through the API server rather than opening a second TLS path to
-# port 10250.
+# port 10250. pods/log is read only for the targets in LOG_TARGETS, and
+# only when that is set (below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -22,7 +23,7 @@ rules:
     resources: ["nodes", "pods"]
     verbs: ["get", "list"]
   - apiGroups: [""]
-    resources: ["nodes/proxy"]
+    resources: ["nodes/proxy", "pods/log"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -38,7 +39,8 @@ subjects:
     name: kubeloupe
     namespace: lens-metrics
 ---
-# 64Mi against a snapshot of roughly 1 MB at the default 24h retention --
+# 64Mi against a snapshot of roughly 1 MB at the default 24h retention,
+# plus up to LOG_MAX_MB (32) of logs if they are turned on --
 # the file holds the store's compressed chunks verbatim. Sized well clear
 # of that because save() writes a temporary file beside the live one and
 # renames, so the peak is both together. No storageClassName, so it takes
@@ -114,6 +116,27 @@ spec:
             # costs nothing.
             - name: SNAPSHOT_INTERVAL_SECONDS
               value: "300"
+            # Logs, off unless the Secret kubeloupe-logs exists, so a cluster
+            # keeps its settings there and this file stays the same
+            # everywhere. `targets` is LOG_TARGETS, such as
+            # `meet/meet-=30d,meet/db-=7d` (namespace[/pod-prefix][=retention]);
+            # `token` the bearer /api/v1/logs asks for; `max-mb` (optional,
+            # 32) the most all of them may take on the volume below -- size
+            # the volume to match. Change any of them and restart the pod.
+            # See the README's Logs section.
+            #   kubectl -n lens-metrics create secret generic kubeloupe-logs \
+            #     --from-literal=targets=meet/meet-=30d \
+            #     --from-literal=token=$(openssl rand -hex 24) \
+            #     --from-literal=max-mb=32
+            - name: LOG_TARGETS
+              valueFrom:
+                secretKeyRef: { name: kubeloupe-logs, key: targets, optional: true }
+            - name: LOG_TOKEN
+              valueFrom:
+                secretKeyRef: { name: kubeloupe-logs, key: token, optional: true }
+            - name: LOG_MAX_MB
+              valueFrom:
+                secretKeyRef: { name: kubeloupe-logs, key: max-mb, optional: true }
           ports:
             - name: http
               containerPort: 9090

@@ -6,12 +6,16 @@
 //! about twenty series that the API server and the kubelet already know.
 //! This reads them directly, keeps a day of samples in memory, and
 //! answers the subset of PromQL Lens actually generates.
+//!
+//! Given `LOG_TARGETS`, it also keeps the named pods' logs on disk
+//! ([`logs`]); without it, none.
 
 mod api;
 mod chunk;
 mod collect;
 mod discovery;
 mod kube;
+mod logs;
 mod promql;
 mod snapshot;
 mod store;
@@ -90,6 +94,29 @@ async fn main() -> Result<()> {
         config.pod_refresh_interval,
     ));
 
+    // Logs have their own loop and keep nothing in the metrics store, so
+    // reading them never waits on, or holds up, a scrape.
+    let mut app = api::router(Arc::clone(&store));
+    if let Some(log_config) = logs::Config::from_env().map(Arc::new) {
+        tokio::spawn(logs::run(
+            kube::Client::in_cluster()?,
+            Arc::clone(&log_config),
+        ));
+        app = app.merge(logs::router(Arc::clone(&log_config)));
+        let targets: Vec<String> = log_config
+            .targets
+            .iter()
+            .map(|t| format!("{}/{} for {}h", t.namespace, t.prefix, t.retention / 3600))
+            .collect();
+        eprintln!(
+            "kubeloupe: logs of {} every {}s, up to {} MB in {}",
+            targets.join(", "),
+            log_config.interval,
+            log_config.max_bytes >> 20,
+            log_config.dir.display(),
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
@@ -112,7 +139,7 @@ async fn main() -> Result<()> {
     // end in SIGKILL -- with the final snapshot never written, which is
     // precisely the case it exists for. Dropping a request mid-flight
     // costs Lens one retry, which it already has five of.
-    let server = axum::serve(listener, api::router(Arc::clone(&store)));
+    let server = axum::serve(listener, app);
     tokio::select! {
         result = server => result?,
         _ = shutdown_signal() => eprintln!("kubeloupe: shutting down"),

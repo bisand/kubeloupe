@@ -90,6 +90,49 @@ impl Client {
         self.get("/api/v1/pods").await
     }
 
+    pub async fn pods_in(&self, namespace: &str) -> Result<List<Pod>> {
+        self.get(&format!("/api/v1/namespaces/{namespace}/pods"))
+            .await
+    }
+
+    /// A container's log with the kubelet's own timestamp on every line,
+    /// from `since` (unix seconds) or, without one, the last `backlog`
+    /// seconds. `previous` reads the run before the latest restart, which
+    /// holds the lines a crash left behind. At most `logs::FETCH_LIMIT`
+    /// bytes, the oldest first, so a long backlog is caught up over several calls.
+    pub async fn container_log(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        since: Option<i64>,
+        backlog: i64,
+        previous: bool,
+    ) -> Result<String> {
+        let limit = crate::logs::FETCH_LIMIT;
+        let from = match since {
+            Some(t) => format!("sinceTime={}", crate::logs::rfc3339(t * 1_000_000_000, 0)),
+            None => format!("sinceSeconds={backlog}"),
+        };
+        let path = format!(
+            "/api/v1/namespaces/{namespace}/pods/{pod}/log?container={container}&timestamps=true&limitBytes={limit}&{from}{}",
+            if previous { "&previous=true" } else { "" }
+        );
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(self.token()?)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("GET {path} returned {status}: {}", body.trim());
+        }
+        Ok(body)
+    }
+
     pub async fn node_stats(&self, node: &str) -> Result<StatsSummary> {
         self.get(&format!("/api/v1/nodes/{node}/proxy/stats/summary"))
             .await
@@ -198,6 +241,8 @@ pub struct ContainerStatus {
     pub name: String,
     #[serde(default)]
     pub image: String,
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 // --- kubelet /stats/summary -------------------------------------------------

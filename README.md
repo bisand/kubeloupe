@@ -17,6 +17,11 @@ This reads them directly, keeps a day of samples in memory, snapshots them
 so a restart costs nothing, and answers the subset of PromQL that Lens
 actually generates.
 
+It can also keep the logs of pods you name, for as long as you say, as
+plain text files that outlive the pods -- see [Logs](#logs-for-the-pods-you-name).
+Off unless configured: an installation that doesn't ask for logs reads,
+writes and serves none.
+
 | | image (compressed) | resident |
 | --- | ---: | ---: |
 | Prometheus + node-exporter + kube-state-metrics | 141.7 MB | ~250 MB |
@@ -316,6 +321,69 @@ published as zero, and `MemTotal` as capacity, so that Lens' `MemTotal -
 (MemFree + Buffers + Cached)` yields the working set. A tool that computes
 memory a different way gets a wrong number, not a missing one.
 
+### Logs, for the pods you name
+
+Off unless asked for, and then only for what is named. The kubelet keeps a
+container's log only while its pod exists, so a rollout or an eviction takes
+the lines with it. Given `LOG_TARGETS`, kubeloupe reads those pods' logs
+through the API server (`pods/log`) every `LOG_INTERVAL_SECONDS` and appends
+them to plain text files, one per target per day:
+
+```
+LOG_TARGETS=meet/meet-=14d,meet/glugg-db-=3d,kube-system
+/var/lib/kubeloupe/logs/meet_meet-/2026-11-13.log
+```
+
+A target is `namespace[/pod-prefix][=retention]` (`90m`, `24h`, `7d`; 24h if
+unset), and a pod belongs to the first target that names it. Pods that no
+target names are never read. Each target's days are deleted once they are
+older than its retention, and `LOG_MAX_MB` caps all of them together,
+oldest day first (never today's). A container that restarted between polls
+has its previous run read too, so a crash's last lines are kept. What is
+lost: anything a pod writes in its last poll interval before it is deleted.
+
+The process holds only where it got to in each container's log, so
+retention costs disk, not memory. After a restart it carries on from the
+newest line on disk.
+
+Lines are stored and served as `<time> <node> <pod>/<container> <text>`:
+
+```
+curl -H "Authorization: Bearer $TOKEN" \
+  'http://prometheus.lens-metrics.svc/api/v1/logs?namespace=meet&pod=meet-&since=3600&match=error&limit=500'
+```
+
+| parameter | |
+| --- | --- |
+| `namespace` | Every target's if unset. |
+| `pod` | A prefix of the pod's name. |
+| `container`, `node` | Exact. |
+| `since` | Seconds back from now; an hour if unset. |
+| `match` | Text the line must contain, ignoring case. |
+| `limit` | The newest this many lines (5000, at most 50000), oldest first. |
+
+Logs say more than metrics do, and anything on the cluster can reach the
+Service, so `/api/v1/logs` asks for `LOG_TOKEN` as a bearer, and logs stay
+off without one. The manifest reads both from an optional Secret:
+
+```
+kubectl -n lens-metrics create secret generic kubeloupe-logs \
+  --from-literal=targets=meet/meet-=30d,meet/glugg-db-=7d \
+  --from-literal=token=$(openssl rand -hex 24) \
+  --from-literal=max-mb=128
+kubectl -n lens-metrics rollout restart deploy/kubeloupe
+```
+
+Retention and the cap are settings, not code: change the Secret and restart
+the pod. Lowering a retention deletes the days past it on the next poll;
+raising one keeps what is on disk and lets it grow. Size the volume for
+`max-mb` plus the metrics snapshot: the supplied claim is 64Mi, enough for
+the default 32. (k3s' local-path doesn't enforce a claim's size, so there
+the cap is what keeps the disk in check.)
+
+To size it, a target needs about its pods' daily log volume times its days:
+`kubectl logs --since=24h <pod> | wc -c`.
+
 ## What it does not cover
 
 - **Per-container disk read/write rates.** `container_fs_reads_bytes_total`
@@ -440,8 +508,13 @@ the manifest says later.
 | `SNAPSHOT_INTERVAL_SECONDS` | `300` | Upper bound on history lost to an *unclean* kill. |
 | `POD_REFRESH_INTERVAL_SECONDS` | `300` | The pod list is the largest read and the slowest-changing, so it has its own cadence. A container it cannot name shortens the wait to one scrape. |
 | `LISTEN_ADDR` | `0.0.0.0:9090` | |
+| `LOG_TARGETS` | *(unset)* | What to keep logs of, and for how long. Unset, no logs are read. See [Logs](#logs-for-the-pods-you-name). |
+| `LOG_TOKEN` | *(unset)* | The bearer `/api/v1/logs` asks for. Required for logs. |
+| `LOG_DIR` | `/var/lib/kubeloupe/logs` | On the snapshot volume in the supplied manifest. |
+| `LOG_MAX_MB` | `32` | All targets' files together. Size the volume to match. |
+| `LOG_INTERVAL_SECONDS` | `15` | Also the most a deleted pod's last lines can be missed by. |
 
-RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy`.
+RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy` and `pods/log`.
 
 ## Build
 

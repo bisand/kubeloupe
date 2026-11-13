@@ -19,7 +19,7 @@ FROM scratch
 # the package attaches to whichever repo it was first connected to by
 # hand, which is how it can end up filed under an unrelated project.
 LABEL org.opencontainers.image.source="https://github.com/bisand/kubeloupe"
-LABEL org.opencontainers.image.description="Metrics for Lens Desktop in one static binary: reads the Kubernetes API and kubelet directly, serves the PromQL subset Lens generates."
+LABEL org.opencontainers.image.description="Metrics for Lens Desktop in one static binary: reads the Kubernetes API and kubelet directly, serves the PromQL subset Lens generates. Optionally keeps the logs of the pods you name."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 # `strip` is left out on purpose, matching postbud: a panic in production
 # still names functions in the backtrace, for about 1 MB.
