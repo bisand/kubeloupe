@@ -111,6 +111,10 @@ spec:
           #   kubectl -n lens-metrics create configmap kubeloupe-config \
           #     --from-literal=STORAGE_DIR=/var/lib/kubeloupe/metrics \
           #     --from-literal=STORAGE_RETENTION_DAYS=30
+          # It is read only at start, so restart the pod after a change --
+          # or keep the settings in files with deploy/with-settings, where
+          # kustomize names the ConfigMap after a hash of its contents and
+          # a change restarts the pod by itself.
           envFrom:
             - configMapRef: { name: kubeloupe-config, optional: true }
           env:

@@ -1,0 +1,23 @@
+# The supplied manifest with its settings kept beside it, in files, so a
+# change to them restarts the pod. Copy this directory, edit kubeloupe.env,
+# and:
+#
+#   kubectl apply -k .
+#
+# kustomize names the ConfigMap after a hash of its contents
+# (kubeloupe-config-<hash>) and points the Deployment's envFrom at that
+# name, so any change is a new pod template and the pod restarts with it.
+# A ConfigMap made by hand, as the manifest's comment shows, keeps its name
+# and the pod reads it only at start: change it and restart the pod
+# yourself. The old hashed ConfigMaps stay until pruned (`--prune`, or Flux
+# or Argo, which prune by default).
+resources:
+  - https://raw.githubusercontent.com/bisand/kubeloupe/main/deploy/kubeloupe.yaml
+
+configMapGenerator:
+  - name: kubeloupe-config
+    namespace: lens-metrics
+    envs: [kubeloupe.env]
+    # Exporters as a file of their own, read into SCRAPE_CONFIG -- JSON is
+    # easier to keep there than on one line of kubeloupe.env.
+    # files: [SCRAPE_CONFIG=scrape.json]

@@ -601,7 +601,14 @@ the manifest says later.
 
 The supplied manifest reads every variable but `SNAPSHOT_PATH` from the
 ConfigMap `kubeloupe-config` when there is one, one key per variable, so a
-cluster keeps its settings there and the manifest stays the same.
+cluster keeps its settings there and the manifest stays the same. The pod
+reads it only at start: after `kubectl edit` or `create`, restart it.
+
+To have a change restart the pod by itself, keep the settings in files
+with [`deploy/with-settings`](deploy/with-settings): copy the directory,
+edit `kubeloupe.env`, and `kubectl apply -k .`. kustomize names the
+ConfigMap after a hash of its contents and points the Deployment at that
+name, so a new setting is a new pod. Flux and Argo apply it as it is.
 
 RBAC is read-only: `get`/`list` on nodes and pods, `get` on `nodes/proxy` and `pods/log`.
 
