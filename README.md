@@ -445,7 +445,8 @@ does in place of VictoriaMetrics:
   `STORAGE_DOWNSAMPLE_AFTER_DAYS` keep one point per
   `STORAGE_DOWNSAMPLE_SECONDS` (300): the last of each, which is what
   keeps `rate()` and `increase()` exact on a counter, at a fraction of the
-  size. A finished day is merged into one segment; nothing is ever
+  size. A finished day is merged into one segment, each series' hours
+  packed into one chunk; nothing is ever
   rewritten in place, and a rewrite goes to a temporary file renamed over
   the old one. The hour in memory is snapshotted as usual (by default to
   `head.snapshot` in the same directory), and a SIGTERM writes it to disk.

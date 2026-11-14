@@ -26,7 +26,8 @@
 //! the entries of the names it asks for, then only the chunks that overlap
 //! it -- with `pread`, so the page cache does the caching.
 //!
-//! Once a day is over its segments are merged into one, and once it is
+//! Once a day is over its segments are merged into one, each series' hours
+//! packed into a single chunk, and once it is
 //! older than `STORAGE_DOWNSAMPLE_AFTER_DAYS` it is rewritten keeping one
 //! point per `STORAGE_DOWNSAMPLE_SECONDS` -- the last, which is what a
 //! counter needs for `rate()` and `increase()` to stay exact.
@@ -48,8 +49,6 @@ use crate::store::{Labels, NAME_LABEL, Sample};
 const MAGIC: &[u8; 4] = b"KLM1";
 const HEADER: u64 = 36;
 const DAY: i64 = 86_400;
-/// A downsampled chunk holds up to a day at five-minute points.
-const DOWNSAMPLED_CHUNK: usize = 288;
 /// Bounds on what a corrupt header may ask to be read.
 const MAX_SECTION: u64 = 1 << 30;
 
@@ -204,9 +203,10 @@ impl Disk {
     }
 
     /// Appends one segment, every series given with its chunks, to the
-    /// file of the day its newest sample is from: the hour flushed at
-    /// midnight belongs to the day it was collected. Nothing is written
-    /// for an empty hour.
+    /// file of the day its oldest sample is from: the hour flushed at
+    /// midnight, which holds the first sample or two of the new day too,
+    /// belongs to the day it was collected. Nothing is written for an
+    /// empty hour.
     pub fn append(&mut self, series: &[(&Labels, &[Chunk])]) -> Result<()> {
         let mut by_name: BTreeMap<&str, Vec<(String, Vec<&Chunk>)>> = BTreeMap::new();
         for (labels, chunks) in series {
@@ -231,12 +231,12 @@ impl Disk {
         let mut segment = header;
         segment.extend_from_slice(&data);
         segment.extend_from_slice(&tail);
-        let newest = series
+        let oldest = series
             .iter()
-            .flat_map(|(_, chunks)| chunks.iter().map(Chunk::last_t))
-            .max()
+            .flat_map(|(_, chunks)| chunks.iter().map(Chunk::first_t))
+            .min()
             .unwrap_or_default();
-        let day = newest.div_euclid(DAY);
+        let day = oldest.div_euclid(DAY);
         let index = match self.days.iter().position(|d| d.day == day) {
             Some(i) => i,
             None => {
@@ -737,23 +737,8 @@ fn rewrite(day: &Day, resolution: i64) -> Result<Day> {
             }
         }
         let mut merged: Vec<(String, Vec<Chunk>)> = Vec::new();
-        for (key, mut chunks) in series {
-            chunks.sort_by_key(Chunk::first_t);
-            let chunks = if resolution > 0 {
-                downsample(&chunks, resolution)?
-            } else {
-                // A chunk overlapping the one before it is the same hour
-                // written twice, by a crash between a flush and the
-                // snapshot that followed it.
-                let mut kept: Vec<Chunk> = Vec::new();
-                for chunk in chunks {
-                    if kept.last().is_none_or(|k| chunk.first_t() > k.last_t()) {
-                        kept.push(chunk);
-                    }
-                }
-                kept
-            };
-            merged.push((key, chunks));
+        for (key, chunks) in series {
+            merged.push((key, repack(&chunks, resolution)?));
         }
         let mut data = Vec::new();
         builder.add(name, &merged, &mut data)?;
@@ -768,25 +753,35 @@ fn rewrite(day: &Day, resolution: i64) -> Result<Day> {
     load_day(day.day, day.path.clone())
 }
 
-/// The last sample of every `resolution`-wide bucket, re-packed into
-/// chunks of up to a day each.
-fn downsample(chunks: &[Chunk], resolution: i64) -> Result<Vec<Chunk>> {
+/// A series' chunks for the day packed into one: each hour's chunk would
+/// otherwise cost an entry, and a fresh start of the encoding, for good.
+/// A sample written twice -- an hour replayed by a crash between a flush
+/// and the snapshot after it -- is kept once. With a `resolution`, only
+/// the last sample of every bucket that wide is kept.
+fn repack(chunks: &[Chunk], resolution: i64) -> Result<Vec<Chunk>> {
     let mut samples: Vec<Sample> = Vec::new();
     for chunk in chunks {
         chunk::decode_into(chunk, &mut samples)?;
     }
     samples.sort_by_key(|s| s.t);
     samples.dedup_by_key(|s| s.t);
-    let mut kept: Vec<Sample> = Vec::new();
-    for sample in samples {
-        match kept.last_mut() {
-            Some(last) if last.t.div_euclid(resolution) == sample.t.div_euclid(resolution) => {
-                *last = sample;
+    if resolution > 0 {
+        let mut kept: Vec<Sample> = Vec::new();
+        for sample in samples {
+            match kept.last_mut() {
+                Some(last) if last.t.div_euclid(resolution) == sample.t.div_euclid(resolution) => {
+                    *last = sample;
+                }
+                _ => kept.push(sample),
             }
-            _ => kept.push(sample),
         }
+        samples = kept;
     }
-    Ok(kept.chunks(DOWNSAMPLED_CHUNK).map(chunk::encode).collect())
+    Ok(if samples.is_empty() {
+        Vec::new()
+    } else {
+        vec![chunk::encode(&samples)]
+    })
 }
 
 #[cfg(test)]
@@ -819,7 +814,7 @@ mod tests {
     /// every hour and maintaining it every day, as the collector does.
     fn feed(memory: &mut Store, disk: &mut Store, days: i64) {
         let mut t = T0;
-        while t < T0 + days * DAY {
+        while t <= T0 + days * DAY {
             for (pod, rate) in [("a", 3.0), ("b", 0.5)] {
                 let n = ((t - T0) / STEP) as f64;
                 for store in [&mut *memory, &mut *disk] {
@@ -831,13 +826,15 @@ mod tests {
                     store.append(labels("g", &[("pod", pod)]), t, (n % 17.0) * rate);
                 }
             }
-            t += STEP;
-            if t % 3_600 == 0 {
+            // As the collector does: the first sample of the hour is taken,
+            // then the hour before it flushed.
+            if t > T0 && t % 3_600 == 0 {
                 disk.flush().unwrap();
+                if t % DAY == 0 {
+                    disk.disk.as_mut().unwrap().maintain(t);
+                }
             }
-            if t % DAY == 0 {
-                disk.disk.as_mut().unwrap().maintain(t);
-            }
+            t += STEP;
         }
     }
 
@@ -885,6 +882,18 @@ mod tests {
         let tier = disk.disk.as_ref().unwrap();
         assert_eq!(tier.days.len(), 3);
         assert!(tier.days[..2].iter().all(|d| d.segments.len() == 1));
+        // Each file starts in its own day: midnight's hour, flushed with the
+        // new day's first sample, stays with the day it was collected in.
+        for d in &tier.days {
+            assert_eq!(d.min_t().div_euclid(DAY), d.day, "day {}", d.day - T0 / DAY);
+        }
+        // And a merged day is one chunk a series, not one an hour.
+        let d = &tier.days[0];
+        for (name, offset, len) in read_names(&d.file, &d.segments[0]).unwrap() {
+            for entry in read_entries(&d.file, &d.segments[0], &name, offset, len).unwrap() {
+                assert_eq!(entry.chunks.len(), 1, "{name} {:?}", entry.labels);
+            }
+        }
 
         for at in [
             T0 + 3_600,
@@ -917,6 +926,9 @@ mod tests {
         cfg.downsample_after = Some(2 * DAY);
         disk.disk = Some(Disk::open(cfg).unwrap());
         feed(&mut memory, &mut disk, 3);
+        // A day's file ends with the next midnight's sample, so the hour
+        // after midnight's maintenance is the one that sees it past.
+        disk.disk.as_mut().unwrap().maintain(T0 + 3 * DAY + 3_600);
 
         let tier = disk.disk.as_ref().unwrap();
         assert_eq!(tier.days[0].segments[0].resolution, 300);
@@ -925,8 +937,10 @@ mod tests {
             "not yet two days old"
         );
         assert!(
-            tier.days[0].size() * 5 < tier.days[1].size(),
-            "downsampled should be far smaller"
+            // Only 2x: these series are so regular that a raw day packed
+            // into one chunk a series is already tiny.
+            tier.days[0].size() * 2 < tier.days[1].size(),
+            "downsampled should be smaller"
         );
         assert_eq!(tier.resolution_since(T0), 300);
         assert_eq!(tier.resolution_since(T0 + DAY + 1), 0);
@@ -963,6 +977,8 @@ mod tests {
         disk.disk = Some(Disk::open(cfg).unwrap());
         feed(&mut memory, &mut disk, 4);
         let tier = disk.disk.as_mut().unwrap();
+        // As in the downsampling test: the hour after midnight's.
+        tier.maintain(T0 + 4 * DAY + 3_600);
         let days: Vec<i64> = tier.days.iter().map(|d| d.day - T0 / DAY).collect();
         assert_eq!(days, [2, 3], "only two days kept");
 
