@@ -171,8 +171,12 @@ pub fn eval_at(data: &Fetched, expr: &Expr, t: i64) -> Value {
                 let begin = samples.partition_point(|s| s.t <= t - window);
                 let end = samples.partition_point(|s| s.t <= t);
                 let rate = |from: usize| {
+                    // Two samples in the window first: with none (a series that stopped), `from` is past the end.
+                    if end < from + 2 {
+                        return None;
+                    }
                     let span = samples[end - 1].t - samples[from].t;
-                    (end >= from + 2 && span > 0).then(|| found.delta(from, end) / span as f64)
+                    (span > 0).then(|| found.delta(from, end) / span as f64)
                 };
                 let value = match func {
                     _ if end == 0 => None,

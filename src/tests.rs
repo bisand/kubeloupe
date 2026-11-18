@@ -423,6 +423,17 @@ fn a_stale_series_stops_answering_rather_than_flatlining() {
 }
 
 #[test]
+fn a_rate_over_a_series_that_stopped_before_the_window_is_empty() {
+    let store = fixture();
+    // Two minutes past the last sample: inside the lookback, but no sample in the [1m] window.
+    // This panicked (index out of bounds) and crash-looped production on 2026-11-18.
+    for f in ["rate", "irate"] {
+        let expr = parser::parse(&format!(r#"{f}(node_cpu_seconds_total{{kubernetes_node=~"node-a"}}[1m])"#)).unwrap();
+        eval::eval(&store, &expr, LAST + 120);
+    }
+}
+
+#[test]
 fn query_range_returns_a_point_per_step() {
     let store = fixture();
     let expr = parser::parse(r#"sum(kubelet_running_pods{instance=~"node-a"})"#).unwrap();
